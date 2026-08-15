@@ -4,7 +4,7 @@
 
 ***
 
-## 使用方法
+## 使用说明
 
 ### 一键安装启动
 
@@ -12,32 +12,33 @@
 mkdir -p /root/potlite && curl -sSL https://github.com/zcrv5/potlite/releases/latest/download/potlite-linux-amd64 -o /root/potlite/potlite && chmod +x /root/potlite/potlite && /root/potlite/potlite install
 ```
 
-执行后即为系统服务、开机自启、任意目录可直接使用 `potlite` 命令。
+执行后自动完成：下载最新版到/root/potlite/、安装为系统服务、开机自启、任意目录可直接使用 `potlite` 命令。
 
 > **安装前必读**
 >
-> 1. 如果是比如腾讯云/阿里云之类的云服务器，需要在云控制台内的安全组放行蜜罐端口的TCP入站，默认20个端口（22,21,23,25,110,135,139,143,445,1433,3306,3389,5432,5900,6379,8080,8888,9200,11211,27017），可在配置中自定义。不放行则扫描流量进不来，蜜罐收不到"客人"；
+> 1. 如果是阿里云/腾讯云之类的云服务器，需要在云控制台内的安全组放行蜜罐端口的TCP入站，默认20个端口（22,21,23,25,110,135,139,143,445,1433,3306,3389,5432,5900,6379,8080,8888,9200,11211,27017），可在配置中自定义。不放行则扫描流量进不来，蜜罐收不到"客人"；
 > 2. 确认逃生通道可用：误封自己的 IP 后 SSH 也进不来（全端口封禁），只能通过云厂商 VNC/OrcaTerm 控制台登录解封；
 > 3. 需要 root 权限（操作内核防火墙）。
 
 ### 分步安装
 
 ```bash
-# 1. 创建程序目录并下载二进制
+# 1. 创建程序目录
 mkdir -p /root/potlite
+
+# 2. 下载二进制程序
 curl -sSL https://github.com/zcrv5/potlite/releases/latest/download/potlite-linux-amd64 -o /root/potlite/potlite
 
-# 2. 赋予执行权限
+# 3. 赋予执行权限
 chmod +x /root/potlite/potlite
 
-# 3. 安装（自动生成配置、安装为系统服务、创建软链、设置开机自启）
+# 4. 安装（自动生成配置、安装为系统服务、创建软链、设置开机自启）
 /root/potlite/potlite install
 
-# 4. 卸载程序（卸载只撤销服务与软链、清除内核封禁；最后输出全部数据文件路径，由你自行决定是否删除。）
+# 5. 卸载程序（卸载只撤销服务与软链、清除内核封禁；最后输出全部数据文件路径，由你自行决定是否删除。）
 /root/potlite/potlite uninstall
 ```
 
-<br />
 
 ***
 
@@ -70,16 +71,16 @@ chmod +x /root/potlite/potlite
 
 ### 配置
 
-配置文件在程序所在目录的 `potlite.config`（首次运行自动生成，含中文注释）。修改后执行 `systemctl reload potlite` 生效。
+配置文件在程序所在目录的 `potlite.config`（默认路径为/root/potlite/potlite.config，首次运行自动生成，含中文注释）。修改后执行 `systemctl reload potlite` 生效。
 
 | 字段              | 默认              | 说明                                  |
 | --------------- | --------------- | ----------------------------------- |
 | `ports`         | 20 个常见端口        | 蜜罐监听端口（逗号分隔）                        |
-| `log.level`     | 0               | 0=不记录 1=记录 CSV 日志                   |
-| `interval.bans` | 1               | 封禁名单落盘间隔（分钟）                        |
-| `interval.log`  | 10              | 日志落盘间隔（分钟）                          |
-| `interval.ddns` | 120             | DDNS 域名解析间隔（分钟）                     |
+| `interval.bans` | 1               | 封禁名单记录间隔（分钟）                        |
+| `log.level`     | 0               | CSV日志等级 0=不记录 1=记录                  |
+| `interval.log`  | 10              | 日志记录间隔（分钟）                          |
 | `ddns.domains`  | 空               | DDNS 白名单域名（逗号分隔）                    |
+| `interval.ddns` | 120             | DDNS 域名解析间隔（分钟）                     |
 | `allow.static`  | 127.0.0.1/8,::1 | 静态白名单                               |
 | `data.dir`      | auto            | 数据目录（auto = /root 可写则 /root，否则程序目录） |
 | `debug.log`     | 0               | 排障日志开关                              |
@@ -88,7 +89,7 @@ chmod +x /root/potlite/potlite
 
 | 文件                  | 说明                                                  |
 | ------------------- | --------------------------------------------------- |
-| `potlite.bans`      | 封禁名单（每行一个 IP/段；按 `interval.bans` 增量落盘，服务器重启后据此恢复封禁） |
+| `potlite.bans`      | 封禁名单（每行一个 IP/段；按 `interval.bans` 间隔时间增量落盘，服务器重启后据此恢复封禁） |
 | `potlite.whitelist` | 白名单文件（仅在有 DDNS 解析结果或手动放行时生成）                        |
 | `potlite.log.csv`   | CSV 日志（`log.level=1` 时启用）                           |
 | `potlite.debug.log` | 排障日志（`debug.log=1` 时启用）                             |
