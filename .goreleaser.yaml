@@ -1,0 +1,40 @@
+version: 2
+project_name: potlite
+
+builds:
+  - id: potlite
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    binary: potlite
+
+archives:
+  # 单二进制直发（用户一行 curl 下载）
+  - id: binary
+    formats:
+      - binary
+    name_template: "potlite-linux-{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  github:
+    owner: zcrv5
+    name: potlite

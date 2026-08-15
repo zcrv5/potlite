@@ -1,0 +1,21 @@
+# 构建产物
+dist/
+potlite
+*.exe
+
+# 数据与日志
+potlite.config
+potlite.bans
+potlite.bans.bak
+potlite.bans.corrupt.*
+potlite.whitelist
+potlite.log.csv
+potlite.debug.log
+potlite.lock
+
+# 诊断程序（内部开发用，不入公开仓库）
+spike/
+cmd/
+
+# 第三方 vendor 副本
+third_party/
