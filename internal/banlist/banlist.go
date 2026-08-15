@@ -21,10 +21,11 @@ import (
 
 // List 封禁名单（内存 map + 文件路径）。
 type List struct {
-	mu     sync.Mutex
-	path   string
-	ips    map[netip.Addr]struct{} // 主名单（落盘 potlite.bans）
-	groups map[string]*group       // 外部黑名单组（文件是真相源，不落盘主文件）
+	mu      sync.Mutex
+	path    string
+	bakPath string // 备份文件路径（程序所在目录；空则禁用回滚）
+	ips     map[netip.Addr]struct{} // 主名单（落盘 potlite.bans）
+	groups  map[string]*group       // 外部黑名单组（文件是真相源，不落盘主文件）
 }
 
 // group 一个黑名单组的当前状态（mtime+size 用于变化侦测，未变化跳过读取）。
@@ -34,9 +35,9 @@ type group struct {
 	size  int64
 }
 
-// New 创建名单（不加载）。
-func New(path string) *List {
-	return &List{path: path, ips: make(map[netip.Addr]struct{}), groups: make(map[string]*group)}
+// New 创建名单（不加载）。bakPath 为备份文件路径（放程序所在目录，可自动回滚）。
+func New(path, bakPath string) *List {
+	return &List{path: path, bakPath: bakPath, ips: make(map[netip.Addr]struct{}), groups: make(map[string]*group)}
 }
 
 // Load 从文件加载名单到内存。文件不存在则空名单；读取失败按 corrupt 保护处理。
@@ -70,7 +71,58 @@ func (l *List) Load() error {
 	if err := sc.Err(); err != nil {
 		return l.preserveCorrupt(err)
 	}
+	// 自动回滚：主文件条目数不足备份的 1/3 → 判定损坏 → 用备份恢复后重新加载
+	if l.bakPath != "" {
+		if bakN, err := countEntries(l.bakPath); err == nil && len(l.ips)*3 < bakN {
+			fmt.Fprintf(os.Stderr, "potlite: 警告: 名单条目异常（%d 条 < 备份 %d 条的 1/3），自动用备份回滚\n", len(l.ips), bakN)
+			if data, err := os.ReadFile(l.bakPath); err == nil {
+				if err := os.WriteFile(l.path, data, 0600); err == nil {
+					l.ips = make(map[netip.Addr]struct{})
+					if f2, err := os.Open(l.path); err == nil {
+						sc2 := bufio.NewScanner(f2)
+						sc2.Buffer(make([]byte, 64*1024), 1024*1024)
+						for sc2.Scan() {
+							line := sc2.Text()
+							if line == "" {
+								continue
+							}
+							if a, err := netip.ParseAddr(line); err == nil {
+								l.ips[a] = struct{}{}
+							} else if p, err := netip.ParsePrefix(line); err == nil {
+								l.ips[p.Addr()] = struct{}{}
+							}
+						}
+						f2.Close()
+					}
+				}
+			}
+		}
+	}
 	return nil
+}
+
+// countEntries 解析名单文件返回条目数（无法解析的行静默跳过）。
+func countEntries(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	n := 0
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if _, err := netip.ParseAddr(line); err == nil {
+			n++
+		} else if _, err := netip.ParsePrefix(line); err == nil {
+			n++
+		}
+	}
+	return n, sc.Err()
 }
 
 // Add 内存加入。返回是否新增（false = 已存在）。
@@ -327,9 +379,11 @@ func (l *List) atomicWrite(ips map[netip.Addr]struct{}) error {
 	}
 	sort.Strings(lines)
 
-	// 轮换 .bak
-	if _, err := os.Stat(l.path); err == nil {
-		_ = os.Rename(l.path, l.path+".bak")
+	// 轮换 .bak（备份放程序所在目录）
+	if l.bakPath != "" {
+		if _, err := os.Stat(l.path); err == nil {
+			_ = os.Rename(l.path, l.bakPath)
+		}
 	}
 	tmp := l.path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)

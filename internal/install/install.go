@@ -134,15 +134,24 @@ func DoUninstall() error {
 	fmt.Printf("  [配置]      %s\n", cfgPath)
 	files := []struct{ name, path string }{
 		{"封禁名单", paths.BansFile(dataDir)},
-		{"封禁名单备份", paths.BansBakFile(dataDir)},
 		{"白名单文件", paths.WhitelistFile(dataDir)},
 		{"CSV 日志", paths.CSVFile(dataDir)},
 		{"debug 日志", paths.DebugLogFile(dataDir)},
-		{"锁文件", paths.LockFile(dataDir)},
 	}
 	for _, p := range files {
 		if _, err := os.Stat(p.path); err == nil {
 			fmt.Printf("  [%s] %s\n", p.name, p.path)
+		}
+	}
+	// 锁文件与名单备份在程序所在目录（不属于数据目录）
+	if lp, err := paths.LockFile(); err == nil {
+		if _, err := os.Stat(lp); err == nil {
+			fmt.Printf("  [锁文件] %s\n", lp)
+		}
+	}
+	if bp, err := paths.BansBakFile(); err == nil {
+		if _, err := os.Stat(bp); err == nil {
+			fmt.Printf("  [名单备份] %s\n", bp)
 		}
 	}
 	// corrupt 残留

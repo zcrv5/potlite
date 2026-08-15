@@ -184,6 +184,15 @@ func downloadFile(url, dst string) error {
 	return err
 }
 
+// newBanlist 创建封禁名单（备份文件放程序所在目录，用于自动回滚）。
+func newBanlist(dir string) *banlist.List {
+	bak, err := paths.BansBakFile()
+	if err != nil {
+		bak = ""
+	}
+	return banlist.New(paths.BansFile(dir), bak)
+}
+
 // ---------- serve ----------
 
 func serve() {
@@ -198,7 +207,9 @@ func serve() {
 	must(err)
 
 	// 单实例锁（flock，进程崩溃自动释放）
-	lock, err := os.OpenFile(paths.LockFile(dir), os.O_CREATE|os.O_RDWR, 0600)
+	lockPath, err := paths.LockFile()
+	must(err)
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	must(err)
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 已有实例在运行（锁文件被占用）")
@@ -215,7 +226,7 @@ func serve() {
 	must(fw.Setup(cfg.Ports))
 
 	// 封禁名单：加载 + 重放（读取失败时保留原文件并警告后继续，不阻塞启动）
-	bl := banlist.New(paths.BansFile(dir))
+	bl := newBanlist(dir)
 	if err := bl.Load(); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 警告:", err)
 	}
@@ -586,7 +597,7 @@ func manage(cmd, arg string) {
 	defer fw.Close()
 	must(fw.Attach())
 
-	bl := banlist.New(paths.BansFile(dir))
+	bl := newBanlist(dir)
 	wf := whitelist.New(paths.WhitelistFile(dir))
 
 	switch cmd {
@@ -620,7 +631,7 @@ func bancount() {
 	must(err)
 	dir, err := paths.DataDir(cfg)
 	must(err)
-	bl := banlist.New(paths.BansFile(dir))
+	bl := newBanlist(dir)
 	must(bl.Load())
 	fmt.Printf("当前封禁 IP 数量：%d\n", bl.Len())
 }
@@ -648,7 +659,7 @@ func status() {
 		fmt.Printf("  数据目录计算失败: %v\n", err)
 		return
 	}
-	bl := banlist.New(paths.BansFile(dir))
+	bl := newBanlist(dir)
 	bl.Load()
 	wf := whitelist.New(paths.WhitelistFile(dir))
 	items, _ := wf.Load()

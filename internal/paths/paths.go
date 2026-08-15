@@ -55,8 +55,23 @@ func isWritable(dir string) bool {
 
 // 数据文件路径（相对数据目录）。
 func BansFile(dir string) string      { return filepath.Join(dir, "potlite.bans") }
-func BansBakFile(dir string) string   { return filepath.Join(dir, "potlite.bans.bak") }
+
+// BansBakFile 名单备份文件路径：放程序所在目录（与锁文件一致，支持自动回滚）。
+func BansBakFile() (string, error) {
+	exeDir, err := ExeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(exeDir, "potlite.bans.bak"), nil
+}
 func WhitelistFile(dir string) string { return filepath.Join(dir, "potlite.whitelist") }
 func CSVFile(dir string) string       { return filepath.Join(dir, "potlite.log.csv") }
 func DebugLogFile(dir string) string  { return filepath.Join(dir, "potlite.debug.log") }
-func LockFile(dir string) string      { return filepath.Join(dir, "potlite.lock") }
+// LockFile 单实例锁文件路径：放程序所在目录（锁与程序绑定，而非数据目录）。
+func LockFile() (string, error) {
+	exeDir, err := ExeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(exeDir, "potlite.lock"), nil
+}

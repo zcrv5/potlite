@@ -17,7 +17,7 @@ type Config struct {
 	IntervalBans int      // bans 落盘间隔（分钟）
 	IntervalLog  int      // CSV 落盘间隔（分钟）
 	IntervalDdns int      // DDNS 解析间隔（分钟）
-	LogLevel     int      // 日志级别 0-3
+	LogLevel     int      // 日志级别 0-1
 	DdnsDomains  []string // DDNS 白名单域名
 	AllowStatic  []string // 静态白名单 IP/CIDR
 	DataDir      string   // auto 或绝对路径
@@ -55,7 +55,7 @@ ports = 22,21,23,25,110,135,139,143,445,1433,3306,3389,5432,5900,6379,8080,8888,
 # 封禁名单保存间隔（单位：分钟）
 interval.bans = 1
 
-# 日志级别：0=不记录 1=记录IP与触发端口 2=增加被拒总次数 3=增加端口明细
+# 日志级别：0=不记录（默认值） 1=记录（IP、拒绝次数、首次封禁时间、最近封禁时间）
 log.level = 0
 # 日志保存间隔（单位：分钟）
 interval.log = 10
