@@ -130,6 +130,16 @@ func updateCmd() {
 		os.Remove(tmp)
 		os.Exit(1)
 	}
+	// 若以系统服务运行则自动重启，无需手动操作
+	if out, err := runOut("systemctl", "is-active", "potlite"); err == nil && strings.TrimSpace(out) == "active" {
+		fmt.Printf("已升级到 v%s，正在重启服务…\n", latest)
+		if _, err := runOut("systemctl", "restart", "potlite"); err != nil {
+			fmt.Fprintln(os.Stderr, "potlite: 自动重启失败，请手动执行 systemctl restart potlite")
+			os.Exit(0)
+		}
+		fmt.Printf("已升级到 v%s 并重启服务完成\n", latest)
+		return
+	}
 	fmt.Printf("已升级到 v%s。若以服务运行，请执行 systemctl restart potlite 生效\n", latest)
 }
 
