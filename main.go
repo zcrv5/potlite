@@ -113,13 +113,17 @@ func serve() {
 	defer fw.Close()
 	must(fw.Setup(cfg.Ports))
 
-	// 封禁名单：加载 + 重放（读取失败时保留原文件并警告后以空名单继续，不阻塞启动）
+	// 封禁名单：加载 + 外部文件整合 + 重放（读取失败时保留原文件并警告后继续，不阻塞启动）
 	bl := banlist.New(paths.BansFile(dir))
 	if err := bl.Load(); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 警告:", err)
-	} else {
-		must(fw.ReplayBans(bl.Snapshot()))
 	}
+	if n, err := bl.ScanMerge(dir); err != nil {
+		fmt.Fprintln(os.Stderr, "potlite: 外部名单扫描失败:", err)
+	} else if n > 0 {
+		fmt.Printf("potlite: 已整合 %d 个外部名单条目\n", n)
+	}
+	must(fw.ReplayBans(bl.Snapshot()))
 
 	// 白名单：内置 + 本机 IP + 配置静态 + 文件，全量重放进内核
 	wlItems := buildWhitelist(cfg, dir)
@@ -169,6 +173,10 @@ func serve() {
 				for _, a := range ips {
 					bl.Add(a)
 				}
+			}
+			// 外部名单文件整合（potlite.bans<数字>），随后一并落盘
+			if n, err := bl.ScanMerge(dir); err == nil && n > 0 {
+				fmt.Printf("potlite: 已整合 %d 个外部名单条目\n", n)
 			}
 			if err := bl.SaveMerge(); err != nil {
 				fmt.Fprintln(os.Stderr, "potlite: 落盘失败:", err)

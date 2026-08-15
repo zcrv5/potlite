@@ -13,7 +13,9 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -103,6 +105,51 @@ func (l *List) Snapshot() []netip.Addr {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Less(out[j]) })
 	return out
+}
+
+// externalRe 外部补充名单文件的匹配规则：potlite.bans 及 potlite.bans<数字>
+// （如 potlite.bans2、potlite.bans10086）。程序自身产物（.bak/.corrupt./.tmp）不匹配。
+var externalRe = regexp.MustCompile(`^potlite\.bans\d*$`)
+
+// ScanMerge 扫描数据目录中全部外部名单文件，解析后合并进内存名单（去重）。
+// 返回新增条目数。单个文件读取失败/行解析失败均容忍跳过。
+// 外部文件支持 # 注释行（搜集的黑名单常带注释）。
+func (l *List) ScanMerge(dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && externalRe.MatchString(e.Name()) {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	before := len(l.ips)
+	for _, fp := range files {
+		f, err := os.Open(fp)
+		if err != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if a, err := netip.ParseAddr(line); err == nil {
+				l.ips[a] = struct{}{}
+			} else if p, err := netip.ParsePrefix(line); err == nil {
+				l.ips[p.Addr()] = struct{}{}
+			}
+		}
+		f.Close()
+	}
+	return len(l.ips) - before, nil
 }
 
 // SaveMerge 增量合并落盘：文件 ∪ 内存，去重后原子写回。
