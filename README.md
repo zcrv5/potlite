@@ -113,19 +113,30 @@ IP,被拒总数,首次拒绝时间,最新拒绝时间
 
 ### 外部黑名单
 
-可以把搜集到的黑名单放到数据目录下，命名为 `potlite.bans<数字>`（如 `potlite.bans2`、`potlite.bans10086`），程序会自动整合进封禁名单（不覆盖、不重复）：
+把黑名单文件放到数据目录（默认 `/root/`），命名为 `potlite.bans` + 任意后缀（如 `potlite.bans2`、`potlite.bans10086`、`potlite.bans国内`），程序每个 `interval.bans` 周期（默认 1 分钟）自动侦测并处理。文件格式：每行一个 IP 或 CIDR 段，`#` 开头为注释行。两种模式：
 
-- 文件格式：每行一个 IP 或 CIDR 段，`#` 开头为注释行；
-- 整合时机：启动时 + 每个 `interval.bans` 周期（默认 1 分钟）；
-- 程序自身产物（`potlite.bans.bak`、`potlite.bans.corrupt.*`）不会被误读。
+**一次性整合模式**：文件**首行**含 `#整合`——条目合并进主名单（`potlite.bans`，只增不减），完成后**源文件自动删除**：
 
-例如下载搜集的黑名单并启用：
+```
+#整合
+1.2.3.4
+5.6.7.0/24
+```
+
+**黑名单组模式**（默认）：无 `#整合` 标记——文件即真相源，条目不写入主文件：
+
+- 文件存在 → 封禁文件内的 IP（启动时和文件变化时生效）；
+- 修改文件 → 只封禁改后内容（被删掉的 IP 自动解除）；
+- 删除文件 → 该文件对应的封禁全部解除；
+- 文件未变化时跳过读取，无额外开销。
+
+例如下载 GitHub 上的共享黑名单启用：
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlite.bans2 -o /root/potlite.bans2
 ```
 
-1 分钟内自动生效，条目随后并入 `potlite.bans` 主文件。
+1 分钟内自动生效。程序自身产物（`potlite.bans.bak`、`potlite.bans.corrupt.*`）不会被误读。
 
 ***
 
@@ -136,7 +147,7 @@ curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlit
 - **IPv6 按 /64 段封禁**：封禁整个网段而非单地址；
 - **白名单多来源**：内置 127.0.0.1 + 本机接口 IP 自动放行 + 静态配置 + DDNS 域名；
 - **持久化**：封禁名单增量落盘、服务器重启自动恢复（`potlite.bans` 只增不减、永不覆盖丢失）；
-- **外部黑名单整合**：数据目录放入 `potlite.bans<数字>`（如 `potlite.bans2`）文件即自动整合进封禁名单（不覆盖、不重复）；
+- **外部黑名单**：数据目录放入 `potlite.bans` + 任意后缀的文件即生效——`#整合` 首行 = 一次性并入主名单（源文件自动删除）；无标记 = 黑名单组（文件为真相源，删改实时生效、删除文件即全部解除）；
 - **日志分级**：`0` = 不记录（默认）；`1` = CSV 记录（IP、被拒总数、首次/最新拒绝时间）；
 - **systemd 集成**：一键装服务、实时状态显示、SIGHUP 热重载、崩溃自愈。
 

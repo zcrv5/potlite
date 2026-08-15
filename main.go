@@ -113,17 +113,23 @@ func serve() {
 	defer fw.Close()
 	must(fw.Setup(cfg.Ports))
 
-	// 封禁名单：加载 + 外部文件整合 + 重放（读取失败时保留原文件并警告后继续，不阻塞启动）
+	// 封禁名单：加载 + 重放（读取失败时保留原文件并警告后继续，不阻塞启动）
 	bl := banlist.New(paths.BansFile(dir))
 	if err := bl.Load(); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 警告:", err)
 	}
-	if n, err := bl.ScanMerge(dir); err != nil {
-		fmt.Fprintln(os.Stderr, "potlite: 外部名单扫描失败:", err)
-	} else if n > 0 {
-		fmt.Printf("potlite: 已整合 %d 个外部名单条目\n", n)
-	}
 	must(fw.ReplayBans(bl.Snapshot()))
+	// 外部黑名单：一次性整合（#整合 文件）/ 黑名单组加载 → 内核同步
+	if needBan, _, err := bl.ScanMerge(dir); err != nil {
+		fmt.Fprintln(os.Stderr, "potlite: 外部名单扫描失败:", err)
+	} else {
+		for _, a := range needBan {
+			_ = fw.Ban(a)
+		}
+		if len(needBan) > 0 {
+			fmt.Printf("potlite: 外部名单已加载 %d 个条目\n", len(needBan))
+		}
+	}
 
 	// 白名单：内置 + 本机 IP + 配置静态 + 文件，全量重放进内核
 	wlItems := buildWhitelist(cfg, dir)
@@ -164,20 +170,36 @@ func serve() {
 	go func() {
 		for {
 			time.Sleep(time.Duration(curCfg.Load().IntervalBans) * time.Minute)
+			// 1) 外部黑名单：一次性整合（#整合 文件并入主名单）/ 黑名单组 diff 同步 → 内核封禁与解封。
+			//    放在内核同步之前，保证 groups 状态最新（组 IP 过滤与 HasMain 保护用）。
+			needBan, needUnban, err := bl.ScanMerge(dir)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "potlite: 外部名单扫描失败:", err)
+			}
+			for _, a := range needBan {
+				_ = fw.Ban(a)
+			}
+			for _, a := range needUnban {
+				if !bl.HasMain(a) {
+					_ = fw.Unban(a)
+				}
+			}
+			// 2) 内核动态封禁（dynset 产生）同步进主名单——组 IP 除外（组由文件管理，不进主文件）
 			if ips, err := fw.ListBanned4(); err == nil {
 				for _, a := range ips {
-					bl.Add(a)
+					if !bl.InGroup(a) {
+						bl.Add(a)
+					}
 				}
 			}
 			if ips, err := fw.ListBanned6(); err == nil {
 				for _, a := range ips {
-					bl.Add(a)
+					if !bl.InGroup(a) {
+						bl.Add(a)
+					}
 				}
 			}
-			// 外部名单文件整合（potlite.bans<数字>），随后一并落盘
-			if n, err := bl.ScanMerge(dir); err == nil && n > 0 {
-				fmt.Printf("potlite: 已整合 %d 个外部名单条目\n", n)
-			}
+			// 3) bans 合并落盘
 			if err := bl.SaveMerge(); err != nil {
 				fmt.Fprintln(os.Stderr, "potlite: 落盘失败:", err)
 			}

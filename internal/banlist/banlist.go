@@ -13,7 +13,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -22,14 +21,22 @@ import (
 
 // List 封禁名单（内存 map + 文件路径）。
 type List struct {
-	mu   sync.Mutex
-	path string
-	ips  map[netip.Addr]struct{} // v4 单 IP / v6 地址（段在文件中按 /64 记）
+	mu     sync.Mutex
+	path   string
+	ips    map[netip.Addr]struct{} // 主名单（落盘 potlite.bans）
+	groups map[string]*group       // 外部黑名单组（文件是真相源，不落盘主文件）
+}
+
+// group 一个黑名单组的当前状态（mtime+size 用于变化侦测，未变化跳过读取）。
+type group struct {
+	ips   map[netip.Addr]struct{}
+	mtime time.Time
+	size  int64
 }
 
 // New 创建名单（不加载）。
 func New(path string) *List {
-	return &List{path: path, ips: make(map[netip.Addr]struct{})}
+	return &List{path: path, ips: make(map[netip.Addr]struct{}), groups: make(map[string]*group)}
 }
 
 // Load 从文件加载名单到内存。文件不存在则空名单；读取失败按 corrupt 保护处理。
@@ -88,11 +95,35 @@ func (l *List) Has(ip netip.Addr) bool {
 	return ok
 }
 
-// Len 数量。
+// Len 当前生效封禁总数（主名单 + 各黑名单组）。
 func (l *List) Len() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return len(l.ips)
+	n := len(l.ips)
+	for _, g := range l.groups {
+		n += len(g.ips)
+	}
+	return n
+}
+
+// HasMain 主名单是否包含该地址（组条目 unban 的保护：主名单有的不能被组删除解除）。
+func (l *List) HasMain(ip netip.Addr) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.ips[ip]
+	return ok
+}
+
+// InGroup 该地址是否属于某个黑名单组（组 IP 由文件管理，不进入主名单/主文件）。
+func (l *List) InGroup(ip netip.Addr) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, g := range l.groups {
+		if _, ok := g.ips[ip]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Snapshot 当前名单副本（排序）。
@@ -107,49 +138,127 @@ func (l *List) Snapshot() []netip.Addr {
 	return out
 }
 
-// externalRe 外部补充名单文件的匹配规则：potlite.bans 及 potlite.bans<数字>
-// （如 potlite.bans2、potlite.bans10086）。程序自身产物（.bak/.corrupt./.tmp）不匹配。
-var externalRe = regexp.MustCompile(`^potlite\.bans\d*$`)
-
-// ScanMerge 扫描数据目录中全部外部名单文件，解析后合并进内存名单（去重）。
-// 返回新增条目数。单个文件读取失败/行解析失败均容忍跳过。
-// 外部文件支持 # 注释行（搜集的黑名单常带注释）。
-func (l *List) ScanMerge(dir string) (int, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0, err
+// isExternal 外部黑名单文件的匹配规则：文件名以 potlite.bans 开头且带任意后缀
+// （如 potlite.bans2、potlite.bans.Aa、potlite.bans国内 等）；
+// 排除程序自身产物（.bak/.corrupt.*/.tmp）与主文件本身（无后缀）。
+func isExternal(name string) bool {
+	if !strings.HasPrefix(name, "potlite.bans") || name == "potlite.bans" {
+		return false
 	}
-	var files []string
-	for _, e := range entries {
-		if !e.IsDir() && externalRe.MatchString(e.Name()) {
-			files = append(files, filepath.Join(dir, e.Name()))
+	suffix := name[len("potlite.bans"):]
+	switch {
+	case suffix == ".bak", suffix == ".tmp", strings.HasPrefix(suffix, ".corrupt."):
+		return false
+	}
+	return true
+}
+
+// readExternal 读外部文件：返回条目集合与是否为"#整合"一次性导入模式（首行含 #整合）。
+// 行解析失败静默跳过；# 注释行跳过。
+func readExternal(fp string) (map[netip.Addr]struct{}, bool, error) {
+	f, err := os.Open(fp)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	ips := make(map[netip.Addr]struct{})
+	first := true
+	integrate := false
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if first {
+			first = false
+			if strings.Contains(line, "#整合") {
+				integrate = true
+				continue
+			}
+		}
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if a, err := netip.ParseAddr(line); err == nil {
+			ips[a] = struct{}{}
+		} else if p, err := netip.ParsePrefix(line); err == nil {
+			ips[p.Addr()] = struct{}{}
 		}
 	}
+	return ips, integrate, sc.Err()
+}
+
+// ScanMerge 扫描数据目录中的外部黑名单文件，返回需要内核封禁/解封的地址（由调用方执行）：
+//   - mtime+size 未变化的文件跳过（省掉无谓读取）；
+//   - 首行含"#整合"的文件：条目并入主名单并删除源文件（一次性导入）；
+//   - 其余文件作为黑名单组：文件为真相源——新增条目进 needBan、被删条目进 needUnban；
+//   - 组文件被删除：该组全部条目进 needUnban（解除封禁）。
+func (l *List) ScanMerge(dir string) (needBan, needUnban []netip.Addr, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	seen := make(map[string]bool)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	before := len(l.ips)
-	for _, fp := range files {
-		f, err := os.Open(fp)
+
+	for _, e := range entries {
+		if e.IsDir() || !isExternal(e.Name()) {
+			continue
+		}
+		seen[e.Name()] = true
+		fp := filepath.Join(dir, e.Name())
+		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 64*1024), 1024*1024)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
+		// mtime+size 缓存：未变化跳过
+		if g, ok := l.groups[e.Name()]; ok && g.mtime.Equal(info.ModTime()) && g.size == info.Size() {
+			continue
+		}
+		ips, integrate, err := readExternal(fp)
+		if err != nil {
+			continue // 读失败容忍（如文件正在被写入）
+		}
+		if integrate {
+			// 一次性整合进主名单（由周期落盘写入 potlite.bans），完成后删除源文件
+			for a := range ips {
+				if _, dup := l.ips[a]; !dup {
+					l.ips[a] = struct{}{}
+					needBan = append(needBan, a)
+				}
 			}
-			if a, err := netip.ParseAddr(line); err == nil {
-				l.ips[a] = struct{}{}
-			} else if p, err := netip.ParsePrefix(line); err == nil {
-				l.ips[p.Addr()] = struct{}{}
+			delete(l.groups, e.Name())
+			_ = os.Remove(fp)
+			continue
+		}
+		// 黑名单组：diff 新旧集合
+		var old map[netip.Addr]struct{}
+		if g, ok := l.groups[e.Name()]; ok {
+			old = g.ips
+		}
+		for a := range ips {
+			if _, existed := old[a]; !existed {
+				needBan = append(needBan, a)
 			}
 		}
-		f.Close()
+		for a := range old {
+			if _, still := ips[a]; !still {
+				needUnban = append(needUnban, a)
+			}
+		}
+		l.groups[e.Name()] = &group{ips: ips, mtime: info.ModTime(), size: info.Size()}
 	}
-	return len(l.ips) - before, nil
+	// 组文件被删除：该组全部解除
+	for name, g := range l.groups {
+		if !seen[name] {
+			for a := range g.ips {
+				needUnban = append(needUnban, a)
+			}
+			delete(l.groups, name)
+		}
+	}
+	return needBan, needUnban, nil
 }
 
 // SaveMerge 增量合并落盘：文件 ∪ 内存，去重后原子写回。
