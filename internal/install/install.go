@@ -21,7 +21,7 @@ const (
 // UnitTemplate 生成 potlite.service 内容。
 func UnitTemplate(exePath, dataDir string) string {
 	return fmt.Sprintf(`[Unit]
-Description=PotLite honeypot (轻蜜罐)
+Description=PotLite (轻蜜罐)
 After=network.target
 
 [Service]

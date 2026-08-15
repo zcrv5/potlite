@@ -22,6 +22,10 @@ type Config struct {
 	AllowStatic  []string // 静态白名单 IP/CIDR
 	DataDir      string   // auto 或绝对路径
 	DebugLog     bool     // debug 日志开关
+	LatestVersion string  // 程序自动维护：每天 0 点检查 GitHub 后写入的最新版本号
+	// 拒绝计数（程序自动维护，每 10 分钟更新）：
+	TotalRejected     uint64 // 总计拒绝次数（历史累计）
+	TotalRejectedBase uint64 // 最近存档时对应的本次启动内核实时值（滚动基数）
 }
 
 var defaultPorts = []int{22, 21, 23, 25, 110, 135, 139, 143, 445, 1433, 3306, 3389, 5432, 5900, 6379, 8080, 8888, 9200, 11211, 27017}
@@ -69,6 +73,13 @@ data.dir = auto
 
 # debug 日志开关：0=不记录（默认） 1=记录程序运行细节（排障时开启）
 debug.log = 0
+
+# 最新版本（程序每天 0 点自动检查并更新，无需手动修改）
+latest.version = 
+
+# 拒绝计数（程序自动维护，每 10 分钟更新，无需手动修改）
+total.rejected = 0
+total.rejected.base = 0
 `
 
 // Load 读取配置文件；文件不存在时先生成默认配置再使用。
@@ -153,12 +164,25 @@ func (c *Config) apply(key, val string) {
 		} else {
 			warnf("debug.log 值无效（需 0 或 1），使用默认 0")
 		}
+	case "latest.version":
+		if val != "" {
+			c.LatestVersion = val
+		}
+	case "total.rejected":
+		if v, err := strconv.ParseUint(val, 10, 64); err == nil {
+			c.TotalRejected = v
+		}
+	case "total.rejected.base":
+		if v, err := strconv.ParseUint(val, 10, 64); err == nil {
+			c.TotalRejectedBase = v
+		}
 	default:
 		warnf("未知配置项 %q 已忽略", key)
 	}
 }
 
 func splitList(val string) []string {
+	val = strings.ReplaceAll(val, "，", ",") // 中文逗号兼容
 	var out []string
 	for _, s := range strings.Split(val, ",") {
 		s = strings.TrimSpace(s)
@@ -195,4 +219,40 @@ func parseIntIn(val string, lo, hi int) (int, bool) {
 
 func warnf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "potlite: 警告: "+format+"\n", args...)
+}
+
+// UpdateKeys 把多个键值写回配置文件（程序自动维护字段用）。
+// 保留原文件全部内容：已有该键则替换值，没有则追加。
+func UpdateKeys(path string, kvs map[string]string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	lines := strings.Split(text, "\n")
+	updated := make(map[string]bool, len(kvs))
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		eq := strings.Index(trimmed, "=")
+		if eq <= 0 {
+			continue
+		}
+		k := strings.ToLower(strings.TrimSpace(trimmed[:eq]))
+		if v, ok := kvs[k]; ok {
+			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			lines[i] = indent + k + " = " + v
+			updated[k] = true
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(strings.Join(lines, "\n"))
+	for k, v := range kvs {
+		if !updated[k] {
+			if !strings.HasSuffix(sb.String(), "\n") {
+				sb.WriteString("\n")
+			}
+			sb.WriteString("\n" + k + " = " + v + "\n")
+		}
+	}
+	return os.WriteFile(path, []byte(sb.String()), 0600)
 }

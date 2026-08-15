@@ -48,13 +48,14 @@ chmod +x /root/potlite/potlite
 
 | 命令                          | 说明           |
 | --------------------------- | ------------ |
-| `potlite -ban 1.2.3.4`      | 手动封禁指定 IP    |
-| `potlite -unban 1.2.3.4`    | 解除封禁         |
-| `potlite -allow 1.2.3.4`    | 加入白名单        |
-| `potlite -disallow 1.2.3.4` | 移出白名单        |
-| `potlite -bancount`         | 查看当前封禁 IP 数量 |
-| `potlite -potport`          | 查看正在监听的端口    |
-| `potlite status`            | 查看运行状态汇总     |
+| `potlite ban 1.2.3.4`      | 手动封禁指定 IP    |
+| `potlite unban 1.2.3.4`    | 解除封禁         |
+| `potlite allow 1.2.3.4`    | 加入白名单        |
+| `potlite disallow 1.2.3.4` | 移出白名单        |
+| `potlite bancount`         | 查看当前封禁 IP 数量 |
+| `potlite potport`          | 查看正在监听的端口    |
+| `potlite status`           | 查看运行状态汇总     |
+| `potlite update`           | 检查并自动升级到最新版本 |
 
 ### systemctl 命令
 
@@ -83,7 +84,9 @@ chmod +x /root/potlite/potlite
 | `interval.ddns` | 120             | DDNS 域名解析间隔（分钟）                     |
 | `allow.static`  | 127.0.0.1/8,::1 | 静态白名单                               |
 | `data.dir`      | auto            | 数据目录（auto = /root 可写则 /root，否则程序目录） |
-| `debug.log`     | 0               | 排障日志开关                              |
+| `debug.log` | 0 | 排障日志开关 |
+
+另有三个程序自动维护的字段（`latest.version` 最新版本、`total.rejected` 总计拒绝次数、`total.rejected.base` 计数基数），无需手动修改。
 
 ### 数据文件
 
@@ -157,11 +160,11 @@ curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlit
 
 **我误连蜜罐端口被封了怎么办？**
 
-封禁是整个 IP 全端口拒绝（包括 SSH）。通过云厂商 VNC/OrcaTerm 控制台登录后执行 `potlite -unban <你的IP>`。若你的出口 IP 解析自 DDNS 域名，下一轮解析会把你加入白名单（白名单在规则链最前放行，访问即恢复）。
+封禁是整个 IP 全端口拒绝（包括 SSH）。通过云厂商 VNC/OrcaTerm 控制台登录后执行 `potlite unban <你的IP>`。若你的出口 IP 解析自 DDNS 域名，下一轮解析会把你加入白名单（白名单在规则链最前放行，访问即恢复）。
 
 **怎么看谁被封了？**
 
-`potlite -bancount` 看数量；`cat potlite.bans` 看名单。
+`potlite bancount` 看数量；`cat potlite.bans` 看名单。
 
 **卸载会删除数据吗？**
 
