@@ -60,7 +60,7 @@ chmod +x /root/potlite/potlite
 
 | 命令                          | 说明                        |
 | --------------------------- | ------------------------- |
-| `systemctl status potlite`  | 查看状态（含监听端口、封禁数、累计拒绝、白名单数） |
+| `systemctl status potlite` | 查看状态（含监听端口和封禁 IP 数量；完整详情推荐使用 `potlite status`） |
 | `systemctl reload potlite`  | 修改配置后热重载（服务不中断）           |
 | `systemctl restart potlite` | 重启服务                      |
 | `systemctl stop potlite`    | 停止服务                      |

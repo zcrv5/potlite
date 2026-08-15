@@ -73,11 +73,15 @@ func (l *List) Load() error {
 	return nil
 }
 
-// Add 内存加入。
-func (l *List) Add(ip netip.Addr) {
+// Add 内存加入。返回是否新增（false = 已存在）。
+func (l *List) Add(ip netip.Addr) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if _, ok := l.ips[ip]; ok {
+		return false
+	}
 	l.ips[ip] = struct{}{}
+	return true
 }
 
 // Remove 内存移除。

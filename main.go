@@ -258,8 +258,9 @@ func serve() {
 			for i, p := range c.Ports {
 				parts[i] = fmt.Sprint(p)
 			}
-			nt.Status(fmt.Sprintf("监听端口: %s | 封禁 IP 数: %d | 累计拒绝次数: %d | 白名单条目数: %d",
-				strings.Join(parts, ", "), bl.Len(), totalRejected(fw), len(wlSet)))
+			nt.Status([]string{
+				fmt.Sprintf("监听端口: %s | 封禁 IP 数: %d", strings.Join(parts, ", "), bl.Len()),
+			})
 			nt.Watchdog()
 			time.Sleep(10 * time.Second)
 		}
@@ -505,6 +506,12 @@ func status() {
 	}
 	fmt.Printf("  监听端口:  %s\n", strings.Join(parts, ", "))
 	fmt.Printf("  封禁 IP 数: %d\n", bl.Len())
+	if fw2, err := nftfw.New(); err == nil {
+		if err := fw2.Attach(); err == nil {
+			fmt.Printf("  累计拒绝次数: %d\n", fw2.TotalRejected())
+		}
+		fw2.Close()
+	}
 	fmt.Printf("  白名单条目: %d\n", len(items))
 	fmt.Printf("  日志级别:  %d\n", cfg.LogLevel)
 	fmt.Printf("  配置:      %s\n", cfgPath)

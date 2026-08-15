@@ -4,6 +4,7 @@ package notify
 
 import (
 	"net"
+	"strings"
 	"sync"
 )
 
@@ -32,10 +33,11 @@ func (n *Notifier) Enabled() bool { return n.ok }
 // Ready 通知服务就绪（Type=notify 必须）。
 func (n *Notifier) Ready() { n.send("READY=1") }
 
-// Status 更新状态行（实测：systemd 的 STATUS 仅支持单行，多行/值内换行均被截断；
-// 以分隔符拼接呈现多类信息）。
-func (n *Notifier) Status(line string) {
-	n.send("STATUS=" + line)
+// Status 更新多行状态（systemctl status 的 Status 段；10 秒级刷新）。
+// 备注：M2 曾因一次不严谨的实验结论改为单行拼接，本轮重新验证 systemd 对
+// STATUS 值内换行的支持——sd_notify 手册允许换行，此前实验被周期刷新覆盖导致误判。
+func (n *Notifier) Status(lines []string) {
+	n.send("STATUS=" + strings.Join(lines, "\n"))
 }
 
 // Watchdog 健康保活（周期必须小于 WatchdogSec）。
