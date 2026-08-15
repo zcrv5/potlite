@@ -122,7 +122,7 @@ IP,被拒总数,首次拒绝时间,最新拒绝时间
 例如下载搜集的黑名单并启用：
 
 ```bash
-curl -sSL <黑名单文件地址> -o /root/potlite.bans2
+curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlite.bans2 -o /root/potlite.bans2
 ```
 
 1 分钟内自动生效，条目随后并入 `potlite.bans` 主文件。
