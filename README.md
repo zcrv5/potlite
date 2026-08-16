@@ -183,7 +183,7 @@ IP,被拒总数,首次拒绝时间,最新拒绝时间
 例如下载 GitHub 上的共享黑名单启用：
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlite.bans2 -o /root/potlite.bans2
+curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlite.bans10086 -o /root/potlite.bans2
 ```
 
 1 分钟内自动生效。程序自身产物（`potlite.bans.bak`、`potlite.bans.corrupt.*`）不会被误读。
