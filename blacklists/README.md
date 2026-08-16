@@ -7,7 +7,7 @@
 在装有 PotLite 的服务器上下载为 `potlite.bans` + 任意后缀（如 `potlite.bans2`），默认 1 分钟（`interval.bans`）内自动生效，无需任何配置：
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlite.bans2 -o /root/potlite.bans2
+curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlite.bans10086 -o /root/potlite.bans2
 ```
 
 **黑名单组模式**（无 `#整合` 标记，即本目录文件的默认用法）：
