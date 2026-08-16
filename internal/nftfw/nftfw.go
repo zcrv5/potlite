@@ -25,6 +25,12 @@ const (
 	setWl4    = "whitelist4"
 	setWl6    = "whitelist6"
 	setBan4   = "banned4"  // counter，无 interval：dynset v4 目标 + 全端口 reject
+	setBan4Nets = "banned4nets" // interval + counter：v4 段封禁（FireHOL 等 CIDR 名单），全端口 reject
+	setObPorts = "ob_ports"     // inet_service：出站自动白名单放行的新连接端口（空 = 全端口模式）
+	setObOk    = "ob_ok"        // ipv4：出站自动白名单（端口限定模式）
+	setObOk6   = "ob_ok6"       // ipv6：同上
+	setObAll   = "ob_all"       // ipv4：出站自动白名单（全端口模式，ports 为空时）
+	setObAll6  = "ob_all6"      // ipv6：同上
 	setBan6   = "banned6"  // interval + counter：IPv6 /64 段主集合（手动写入）
 	setPend6  = "pending6" // counter，无 interval：dynset v6 目标，周期搬运进 banned6
 )
@@ -38,8 +44,14 @@ type FW struct {
 	wl4   *nftables.Set
 	wl6   *nftables.Set
 	ban4  *nftables.Set
+	ban4Nets *nftables.Set
 	ban6  *nftables.Set
 	pend6 *nftables.Set
+	obPorts *nftables.Set
+	obOk  *nftables.Set
+	obOk6 *nftables.Set
+	obAll *nftables.Set
+	obAll6 *nftables.Set
 }
 
 // New 建立 nftables 连接。
@@ -92,13 +104,25 @@ func (f *FW) Attach() error {
 			f.wl6 = s
 		case setBan4:
 			f.ban4 = s
+		case setBan4Nets:
+			f.ban4Nets = s
 		case setBan6:
 			f.ban6 = s
 		case setPend6:
 			f.pend6 = s
+		case setObPorts:
+			f.obPorts = s
+		case setObOk:
+			f.obOk = s
+		case setObOk6:
+			f.obOk6 = s
+		case setObAll:
+			f.obAll = s
+		case setObAll6:
+			f.obAll6 = s
 		}
 	}
-	if f.wl4 == nil || f.wl6 == nil || f.ban4 == nil || f.ban6 == nil || f.pend6 == nil {
+	if f.wl4 == nil || f.wl6 == nil || f.ban4 == nil || f.ban4Nets == nil || f.ban6 == nil || f.pend6 == nil {
 		return fmt.Errorf("防火墙集合不完整，请重新运行 potlite serve")
 	}
 	return nil
@@ -116,9 +140,15 @@ func (f *FW) Setup(ports []int) error {
 	f.wl4 = &nftables.Set{Table: f.table, Name: setWl4, KeyType: nftables.TypeIPAddr, Interval: true}
 	f.wl6 = &nftables.Set{Table: f.table, Name: setWl6, KeyType: nftables.TypeIP6Addr, Interval: true}
 	f.ban4 = &nftables.Set{Table: f.table, Name: setBan4, KeyType: nftables.TypeIPAddr, Counter: true}
+	f.ban4Nets = &nftables.Set{Table: f.table, Name: setBan4Nets, KeyType: nftables.TypeIPAddr, Interval: true, Counter: true}
 	f.ban6 = &nftables.Set{Table: f.table, Name: setBan6, KeyType: nftables.TypeIP6Addr, Interval: true, Counter: true}
 	f.pend6 = &nftables.Set{Table: f.table, Name: setPend6, KeyType: nftables.TypeIP6Addr, Counter: true}
-	for _, s := range []*nftables.Set{f.ports, f.wl4, f.wl6, f.ban4, f.ban6, f.pend6} {
+	f.obPorts = &nftables.Set{Table: f.table, Name: setObPorts, KeyType: nftables.TypeInetService}
+	f.obOk = &nftables.Set{Table: f.table, Name: setObOk, KeyType: nftables.TypeIPAddr}
+	f.obOk6 = &nftables.Set{Table: f.table, Name: setObOk6, KeyType: nftables.TypeIP6Addr}
+	f.obAll = &nftables.Set{Table: f.table, Name: setObAll, KeyType: nftables.TypeIPAddr}
+	f.obAll6 = &nftables.Set{Table: f.table, Name: setObAll6, KeyType: nftables.TypeIP6Addr}
+	for _, s := range []*nftables.Set{f.ports, f.wl4, f.wl6, f.ban4, f.ban4Nets, f.ban6, f.pend6, f.obPorts, f.obOk, f.obOk6, f.obAll, f.obAll6} {
 		if err := f.conn.AddSet(s, nil); err != nil {
 			return fmt.Errorf("创建集合 %s 失败: %w", s.Name, err)
 		}
@@ -142,7 +172,12 @@ func (f *FW) Setup(ports []int) error {
 		return fmt.Errorf("写入端口失败: %w", err)
 	}
 
-	// 10 条规则
+	// 规则（established 回程放行最前，出站自动白名单其后）
+	f.addRule(f.ruleEstablished())
+	f.addRule(f.ruleObAccept(false))
+	f.addRule(f.ruleObAccept(true))
+	f.addRule(f.ruleObAcceptAll(false))
+	f.addRule(f.ruleObAcceptAll(true))
 	f.addRule(f.ruleWhitelist(false))
 	f.addRule(f.ruleWhitelist(true))
 	f.addRule(f.ruleBannedDrop(false, setBan4))
@@ -151,12 +186,44 @@ func (f *FW) Setup(ports []int) error {
 	f.addRule(f.ruleDynsetBan(false, setBan4))
 	f.addRule(f.ruleDynsetBan(true, setPend6))
 	f.addRule(f.ruleAllReject(false, setBan4))
+	f.addRule(f.ruleAllReject(false, setBan4Nets))
 	f.addRule(f.ruleAllReject(true, setPend6))
 	f.addRule(f.ruleAllReject(true, setBan6))
 	return f.conn.Flush()
 }
 
 // Ban 封禁 IP：IPv4 写单 IP 进 banned4；IPv6 取 /64 段写 banned6（双端点表示）。
+// BanPrefix 封禁一个前缀段（v4 任意段 / v6 任意段），带计数器。
+// v4 段进 banned4nets（interval），v6 段进 banned6。
+func (f *FW) BanPrefix(p netip.Prefix) error {
+	p = p.Masked()
+	if p.Addr().Is4() {
+		if err := f.conn.SetAddElements(f.ban4Nets, prefixElems(p)); err != nil {
+			return err
+		}
+		return f.conn.Flush()
+	}
+	if err := f.conn.SetAddElements(f.ban6, prefixElems(p)); err != nil {
+		return err
+	}
+	return f.conn.Flush()
+}
+
+// UnbanPrefix 解除一个前缀段的封禁。
+func (f *FW) UnbanPrefix(p netip.Prefix) error {
+	p = p.Masked()
+	if p.Addr().Is4() {
+		if err := f.conn.SetDeleteElements(f.ban4Nets, prefixElems(p)); err != nil {
+			return err
+		}
+		return f.conn.Flush()
+	}
+	if err := f.conn.SetDeleteElements(f.ban6, prefixElems(p)); err != nil {
+		return err
+	}
+	return f.conn.Flush()
+}
+
 func (f *FW) Ban(ip netip.Addr) error {
 	if ip.Is4() {
 		if err := f.conn.SetAddElements(f.ban4, []nftables.SetElement{{Key: ip.AsSlice()}}); err != nil {
@@ -388,7 +455,18 @@ func (f *FW) ListBannedCounters() map[string]uint64 {
 	return out
 }
 
-// ListBanned4 列出当前 banned4 中的全部地址（含 dynset 动态封禁）。
+// BannedCount 当前内核封禁条目总数（banned4 单 IP + banned4nets 段 + banned6 段）。
+func (f *FW) BannedCount() int {
+	n := 0
+	for _, set := range []*nftables.Set{f.ban4, f.ban4Nets, f.ban6} {
+		if els, err := f.conn.GetSetElements(set); err == nil {
+			n += len(els)
+		}
+	}
+	return n
+}
+
+// ListBanned4 列出当前 banned4（单 IP）+ banned4nets（段起点）中的全部地址。
 func (f *FW) ListBanned4() ([]netip.Addr, error) {
 	els, err := f.conn.GetSetElements(f.ban4)
 	if err != nil {
@@ -398,6 +476,17 @@ func (f *FW) ListBanned4() ([]netip.Addr, error) {
 	for _, el := range els {
 		if a, ok := netip.AddrFromSlice(el.Key); ok {
 			out = append(out, a)
+		}
+	}
+	// banned4nets：段元素（双端点），取起点地址（InGroup 含段匹配，组段不进主名单）
+	if elsN, err := f.conn.GetSetElements(f.ban4Nets); err == nil {
+		for _, el := range elsN {
+			if el.IntervalEnd {
+				continue
+			}
+			if a, ok := netip.AddrFromSlice(el.Key); ok {
+				out = append(out, a)
+			}
 		}
 	}
 	return out, nil
@@ -419,6 +508,53 @@ func (f *FW) ListBanned6() ([]netip.Addr, error) {
 		}
 	}
 	return out, nil
+}
+
+// SyncObPorts 同步出站自动白名单的放行端口集合（启动/重载时调用）。
+func (f *FW) SyncObPorts(ports []int) error {
+	f.conn.FlushSet(f.obPorts)
+	if len(ports) == 0 {
+		return f.conn.Flush()
+	}
+	els := make([]nftables.SetElement, 0, len(ports))
+	for _, p := range ports {
+		els = append(els, nftables.SetElement{Key: []byte{byte(p >> 8), byte(p & 0xff)}})
+	}
+	if err := f.conn.SetAddElements(f.obPorts, els); err != nil {
+		return err
+	}
+	return f.conn.Flush()
+}
+
+// SyncOutbound 全量刷新出站自动白名单集合（过期判定由调用方维护：只写"应保留"的远端）。
+// allPorts=true 时远端进入全端口模式集合（ob_all），否则进端口限定集合（ob_ok）；另一模式集合同步清空。
+func (f *FW) SyncOutbound(allPorts bool, v4, v6 []netip.Addr) error {
+	okSet, ok6 := f.obOk, f.obOk6
+	other, other6 := f.obAll, f.obAll6
+	if allPorts {
+		okSet, ok6 = f.obAll, f.obAll6
+		other, other6 = f.obOk, f.obOk6
+	}
+	write := func(set *nftables.Set, ips []netip.Addr) error {
+		f.conn.FlushSet(set)
+		if len(ips) == 0 {
+			return nil
+		}
+		els := make([]nftables.SetElement, 0, len(ips))
+		for _, a := range ips {
+			els = append(els, nftables.SetElement{Key: a.AsSlice()})
+		}
+		return f.conn.SetAddElements(set, els)
+	}
+	if err := write(okSet, v4); err != nil {
+		return err
+	}
+	if err := write(ok6, v6); err != nil {
+		return err
+	}
+	f.conn.FlushSet(other)
+	f.conn.FlushSet(other6)
+	return f.conn.Flush()
 }
 
 // Close 关闭连接。
@@ -447,6 +583,60 @@ func matchTCPPortsAndNew() []expr.Any {
 		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: []byte{0x08, 0, 0, 0}, Xor: []byte{0, 0, 0, 0}},
 		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0, 0, 0, 0}},
 	}
+}
+
+// matchTCPDportSet 匹配"tcp dport @指定集合"（不含 ct 状态条件）。
+func matchTCPDportSet(setName string) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		&expr.Lookup{SourceRegister: 1, SetName: setName},
+	}
+}
+
+// ruleEstablished 规则 0：已建立连接的回程流量放行（conntrack 标准正典）。
+// state & (ESTABLISHED|RELATED) != 0 → accept。
+func (f *FW) ruleEstablished() *nftables.Rule {
+	return &nftables.Rule{Table: f.table, Chain: f.chain, Exprs: []expr.Any{
+		&expr.Ct{Register: 1, Key: expr.CtKeySTATE},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: []byte{0x06, 0, 0, 0}, Xor: []byte{0, 0, 0, 0}},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0, 0, 0, 0}},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	}}
+}
+
+// ruleObAccept 出站自动白名单：白名单 IP 对放行端口集合的新连接 accept。
+func (f *FW) ruleObAccept(isV6 bool) *nftables.Rule {
+	setName := setObOk
+	if isV6 {
+		setName = setObOk6
+	}
+	exprs := matchTCPDportSet(setObPorts)
+	exprs = append(exprs, matchSaddr(isV6)...)
+	exprs = append(exprs,
+		&expr.Lookup{SourceRegister: 1, SetName: setName},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	)
+	return &nftables.Rule{Table: f.table, Chain: f.chain, Exprs: exprs}
+}
+
+// ruleObAcceptAll 出站自动白名单（全端口模式，outbound.ports 为空时）：白名单 IP 的 TCP 新连接全端口 accept。
+func (f *FW) ruleObAcceptAll(isV6 bool) *nftables.Rule {
+	setName := setObAll
+	if isV6 {
+		setName = setObAll6
+	}
+	exprs := []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
+	}
+	exprs = append(exprs, matchSaddr(isV6)...)
+	exprs = append(exprs,
+		&expr.Lookup{SourceRegister: 1, SetName: setName},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	)
+	return &nftables.Rule{Table: f.table, Chain: f.chain, Exprs: exprs}
 }
 
 // matchSaddr 返回 nfproto 限定 + saddr 加载（inet 表必须限定协议族）。

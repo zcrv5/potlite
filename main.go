@@ -78,6 +78,20 @@ func main() {
 		must(install.DoUninstall())
 	case "info":
 		infoCmd(hasJSON())
+	case "reload":
+		out, err := runOut("systemctl", "reload", "potlite")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "potlite: 重载失败: %s\n", strings.TrimSpace(out))
+			os.Exit(1)
+		}
+		fmt.Println("配置已重载")
+	case "restart":
+		out, err := runOut("systemctl", "restart", "potlite")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "potlite: 重启失败: %s\n", strings.TrimSpace(out))
+			os.Exit(1)
+		}
+		fmt.Println("服务已重启")
 	case "stat":
 		statCmd(hasJSON())
 	case "stats":
@@ -115,18 +129,26 @@ func hasJSON() bool {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `PotLite 轻蜜罐 使用方法：
-  potlite install          一键安装为系统服务
-  potlite uninstall        卸载（停服、清内核封禁、列出全部产物文件）
-  potlite info             查看运行信息
-  potlite stat [N]         本次启动拒绝次数 Top N 排行（默认前 10）
-  potlite stats [N]        总计拒绝次数 Top N 排行（保存日志时才有；无日志时等同本次启动）
-  potlite update           检查并自动升级到最新版本
-  potlite ban <IP>         封禁 IP
-  potlite unban <IP>       解封 IP
-  potlite allow <IP[/段]>      加入白名单
-  potlite disallow <IP[/段]>   移出白名单
-  potlite bancount         当前封禁 IP 数量
-  potlite port             查看监听端口`)
+
+  安装与管理
+    potlite install              一键安装为系统服务
+    potlite uninstall            卸载（停服、清内核封禁、列出全部产物文件）
+    potlite update               检查并自动升级到最新版本
+    potlite reload               重载配置
+    potlite restart              重启服务
+
+  信息查询
+    potlite info                 查看运行信息（推荐使用）
+    potlite port                 查看监听端口
+    potlite bancount             当前封禁 IP 数量
+    potlite stat [N]             本次启动拒绝次数 Top N 排行（默认前 10）
+    potlite stats [N]            总计拒绝次数 Top N 排行（保存日志时才有；无日志时等同本次启动）
+
+  IP操作
+    potlite ban <IP>             封禁 IP
+    potlite unban <IP>           解封 IP
+    potlite allow <IP[/段]>          加入白名单
+    potlite disallow <IP[/段]>       移出白名单`)
 }
 
 // ---------- update ----------
@@ -331,6 +353,9 @@ func serve() {
 	must(err)
 	defer fw.Close()
 	must(fw.Setup(cfg.Ports))
+	if err := fw.SyncObPorts(cfg.OutboundPorts); err != nil {
+		fmt.Fprintln(os.Stderr, "potlite: 出站放行端口同步失败:", err)
+	}
 
 	// 封禁名单：加载 + 重放（读取失败时保留原文件并警告后继续，不阻塞启动）
 	bl := newBanlist(dir)
@@ -344,8 +369,8 @@ func serve() {
 	if needBan, _, err := bl.ScanMerge(dir); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 外部名单扫描失败:", err)
 	} else {
-		for _, a := range needBan {
-			_ = fw.Ban(a)
+		for _, p := range needBan {
+			_ = fw.BanPrefix(p)
 		}
 		if len(needBan) > 0 {
 			fmt.Printf("potlite: 外部名单已加载 %d 个条目\n", len(needBan))
@@ -401,12 +426,12 @@ func serve() {
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "potlite: 外部名单扫描失败:", err)
 			}
-			for _, a := range needBan {
-				_ = fw.Ban(a)
+			for _, p := range needBan {
+				_ = fw.BanPrefix(p)
 			}
-			for _, a := range needUnban {
-				if !bl.HasMain(a) {
-					_ = fw.Unban(a)
+			for _, p := range needUnban {
+				if !bl.HasMain(p.Addr()) {
+					_ = fw.UnbanPrefix(p)
 				}
 			}
 			// 2) 内核动态封禁（dynset 产生）同步进主名单——组 IP 除外（组由文件管理，不进主文件）
@@ -469,9 +494,60 @@ func serve() {
 			if cl.Level() >= 1 {
 				cl.SetCounters(fw.ListBannedCounters())
 			}
-			if err := cl.Save(); err != nil {
-				fmt.Fprintln(os.Stderr, "potlite: CSV 落盘失败:", err)
+		if err := cl.Save(); err != nil {
+			fmt.Fprintln(os.Stderr, "potlite: CSV 落盘失败:", err)
+		}
+	}
+	}()
+
+	// 出站自动白名单：每 60 秒扫描 /proc/net/tcp，把"本机主动 TCP 连出"的远端 IP
+	// 写入白名单集合。过期由程序维护：普通远端按 outbound.minutes、黑名单内远端固定 10 分钟，
+	// 超时未再出现即从集合移除（每轮全量重写）。
+	go func() {
+		lastSeen := make(map[netip.Addr]time.Time)
+		isBlack := make(map[netip.Addr]bool)
+		for {
+			time.Sleep(60 * time.Second)
+			c := curCfg.Load()
+			if !c.OutboundAllow {
+				_ = fw.SyncOutbound(true, nil, nil)
+				continue
 			}
+			v4, v6, b4, b6 := outboundPeers(bl)
+			now := time.Now()
+			mark := func(addrs []netip.Addr, black bool) {
+				for _, a := range addrs {
+					lastSeen[a] = now
+					isBlack[a] = black
+				}
+			}
+			mark(v4, false)
+			mark(v6, false)
+			mark(b4, true)
+			mark(b6, true)
+			// 过滤未超时条目
+			var keep4, keep6 []netip.Addr
+			for a, t := range lastSeen {
+				limit := time.Duration(c.OutboundMinutes) * time.Minute
+				if isBlack[a] {
+					limit = time.Duration(c.OutboundBlackMinutes) * time.Minute
+				}
+				if now.Sub(t) > limit {
+					delete(lastSeen, a)
+					delete(isBlack, a)
+					continue
+				}
+				if a.Is4() {
+					keep4 = append(keep4, a)
+				} else {
+					keep6 = append(keep6, a)
+				}
+			}
+			if err := fw.SyncOutbound(len(c.OutboundPorts) == 0, keep4, keep6); err != nil {
+				fmt.Fprintln(os.Stderr, "potlite: 出站白名单同步失败:", err)
+			}
+			fmt.Printf("potlite: 出站白名单已刷新（普通 %d、黑名单内 %d）\n",
+				len(v4)+len(v6), len(b4)+len(b6))
 		}
 	}()
 
@@ -577,14 +653,17 @@ func reload(cfgPath, dir string, fw *nftfw.FW, bl *banlist.List,
 	fmt.Println("potlite: 配置已热重载")
 
 	if err := fw.SyncPorts(newCfg.Ports); err != nil {
-		fmt.Fprintln(os.Stderr, "potlite: 端口集合更新失败:", err)
+		fmt.Fprintln(os.Stderr, "potlite: 端口同步失败:", err)
 	}
+	_ = fw.SyncObPorts(newCfg.OutboundPorts)
 	failed := startHP()
 	failedPorts.Store(failed)
 	if len(failed) > 0 {
 		fmt.Printf("potlite: %d 个端口绑定失败，其余端口已正常监听\n", len(failed))
 	}
 	refreshWhitelist(newCfg, dir, fw, wlSet)
+	// FireHOL 开关可能已变：立即同步（下载/清理），新文件由下一周期 ScanMerge 收录
+	syncFirehol(newCfg, dir)
 	// 日志级别热切换
 	cl.SetLevel(newCfg.LogLevel)
 	dlogf(dir, "配置热重载：端口=%d 级别=%d", len(newCfg.Ports), newCfg.LogLevel)
@@ -759,11 +838,18 @@ func bancount(jsonOut bool) {
 	must(err)
 	bl := newBanlist(dir)
 	must(bl.Load())
+	n := bl.Len()
+	if fw2, err := nftfw.New(); err == nil {
+		if err := fw2.Attach(); err == nil {
+			n = fw2.BannedCount()
+		}
+		fw2.Close()
+	}
 	if jsonOut {
-		printJSON(map[string]any{"banned": bl.Len()})
+		printJSON(map[string]any{"banned": n})
 		return
 	}
-	fmt.Printf("当前封禁 IP 数量：%d\n", bl.Len())
+	fmt.Printf("当前封禁 IP 数量：%d\n", n)
 }
 
 // portCmd 查看监听端口（与 info 的端口部分一致：已监听 + 失败时的绑定失败端口）。
@@ -822,10 +908,11 @@ func infoCmd(jsonOut bool) {
 		}
 	}
 	var curRej, totalRej uint64
+	bannedN := 0
 	if fw2, err := nftfw.New(); err == nil {
 		if err := fw2.Attach(); err == nil {
 			curRej = fw2.TotalRejected()
-			totalRej = cfg.TotalRejected + (curRej - cfg.TotalRejectedBase)
+			bannedN = fw2.BannedCount()
 		}
 		fw2.Close()
 	}
@@ -836,7 +923,7 @@ func infoCmd(jsonOut bool) {
 			"service":          serviceState(),
 			"listening_ports":  okList,
 			"failed_ports":     failList,
-			"banned":           bl.Len(),
+			"banned":           bannedN,
 			"rejected_current": curRej,
 			"rejected_total":   totalRej,
 			"whitelist":        len(items),
@@ -856,7 +943,7 @@ func infoCmd(jsonOut bool) {
 	if len(failList) > 0 {
 		fmt.Printf("  绑定失败端口: %s\n", compactPorts(failList))
 	}
-	fmt.Printf("  封禁 IP 数: %d\n", bl.Len())
+	fmt.Printf("  封禁 IP 数: %d\n", bannedN)
 	fmt.Printf("  本次启动拒绝次数: %d\n", curRej)
 	fmt.Printf("  总计拒绝次数: %d\n", totalRej)
 	fmt.Printf("  白名单条目: %d\n", len(items))
@@ -1062,7 +1149,7 @@ var fireholSources = []struct {
 }{
 	{func(c *config.Config) bool { return c.FireholLevel1 }, "firehol_level1.netset", "potlite.bans.firehol.level1"},
 	{func(c *config.Config) bool { return c.FireholWeb }, "firehol_webserver.netset", "potlite.bans.firehol.webserver"},
-	{func(c *config.Config) bool { return c.FireholIpsum3 }, "ipsum_3.netset", "potlite.bans.firehol.ipsum3"},
+	{func(c *config.Config) bool { return c.FireholIpsum3 }, "ipsum_3.ipset", "potlite.bans.firehol.ipsum3"},
 }
 
 // syncFirehol 按配置下载/清理 FireHOL 黑名单（启动时 + 每天 0 点调用）。
@@ -1080,6 +1167,14 @@ func syncFirehol(cfg *config.Config, dir string) {
 			_ = os.Remove(tmp)
 			continue
 		}
+		// ipset 格式转换（create/add 命令行 → 纯 IP/CIDR 列表）
+		if strings.HasSuffix(src.remote, ".ipset") {
+			if err := convertIpset(tmp); err != nil {
+				fmt.Fprintf(os.Stderr, "potlite: FireHOL %s 格式转换失败，保留旧文件\n", src.remote)
+				_ = os.Remove(tmp)
+				continue
+			}
+		}
 		if !validBlocklist(tmp) {
 			fmt.Fprintf(os.Stderr, "potlite: FireHOL %s 校验失败（文件异常），保留旧文件\n", src.remote)
 			_ = os.Remove(tmp)
@@ -1092,6 +1187,125 @@ func syncFirehol(cfg *config.Config, dir string) {
 			_ = os.Remove(tmp)
 		}
 	}
+}
+
+// outboundPeers 扫描 /proc/net/tcp(+tcp6)，返回"本机主动 TCP 连出"的远端 IP：
+// v4/v6 为普通远端（超时按配置），black4/black6 为落在黑名单内（任意黑名单：组或主名单）的远端
+// （超时固定 10 分钟，避免误白长期放行）。
+// 判别：ESTABLISHED + 本机为源（私网/回环地址）+ 本地 ephemeral 端口（≥32768）。
+// 注意：7.x 内核无 /proc/net/nf_conntrack（procfs 接口已移除）；/proc/net/tcp 为 2.4 起稳定接口，全内核可用。
+func outboundPeers(bl *banlist.List) ([]netip.Addr, []netip.Addr, []netip.Addr, []netip.Addr) {
+	seen4 := make(map[netip.Addr]struct{})
+	seen6 := make(map[netip.Addr]struct{})
+	black4 := make(map[netip.Addr]struct{})
+	black6 := make(map[netip.Addr]struct{})
+	scan := func(path string, is6 bool) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+		lines := strings.Split(string(data), "\n")
+		for i, line := range lines {
+			if i == 0 {
+				continue // 表头
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 4 || fields[3] != "01" {
+				continue // 仅 ESTABLISHED
+			}
+			local := strings.Split(fields[1], ":")
+			remote := strings.Split(fields[2], ":")
+			if len(local) != 2 || len(remote) != 2 {
+				continue
+			}
+			port, err := strconv.ParseInt(local[1], 16, 32)
+			if err != nil || port < 32768 {
+				continue // 非 ephemeral 端口 → 非本机出站客户端
+			}
+			lip := procIP(local[0], is6)
+			rip := procIP(remote[0], is6)
+			if !lip.IsPrivate() && !lip.IsLoopback() {
+				continue // 本机地址非内网 → 非本机
+			}
+			inBlack := bl.InGroup(rip) || bl.HasMain(rip)
+			if is6 {
+				if inBlack {
+					black6[rip] = struct{}{}
+				} else {
+					seen6[rip] = struct{}{}
+				}
+			} else {
+				if inBlack {
+					black4[rip] = struct{}{}
+				} else {
+					seen4[rip] = struct{}{}
+				}
+			}
+		}
+	}
+	scan("/proc/net/tcp", false)
+	scan("/proc/net/tcp6", true)
+	toSlice := func(m map[netip.Addr]struct{}) []netip.Addr {
+		out := make([]netip.Addr, 0, len(m))
+		for a := range m {
+			out = append(out, a)
+		}
+		return out
+	}
+	return toSlice(seen4), toSlice(seen6), toSlice(black4), toSlice(black6)
+}
+
+// procIP 解析 /proc/net/tcp 的十六进制 IP（IPv4 小端 4 字节 / IPv6 4 组小端 uint32）。
+func procIP(hex string, is6 bool) netip.Addr {
+	if !is6 {
+		v, err := strconv.ParseUint(hex, 16, 32)
+		if err != nil {
+			return netip.Addr{}
+		}
+		b := []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}
+		a, _ := netip.AddrFromSlice(b)
+		return a
+	}
+	if len(hex) != 32 {
+		return netip.Addr{}
+	}
+	var b [16]byte
+	for i := 0; i < 4; i++ {
+		v, err := strconv.ParseUint(hex[i*8:(i+1)*8], 16, 32)
+		if err != nil {
+			return netip.Addr{}
+		}
+		b[i*4] = byte(v)
+		b[i*4+1] = byte(v >> 8)
+		b[i*4+2] = byte(v >> 16)
+		b[i*4+3] = byte(v >> 24)
+	}
+	a, _ := netip.AddrFromSlice(b[:])
+	return a
+}
+
+// convertIpset 把 ipset 格式文件（create ... / add <name> <ip>）转换为纯 IP/CIDR 列表（原地覆盖）。
+func convertIpset(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "create ") {
+			continue
+		}
+		if strings.HasPrefix(line, "add ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				out = append(out, fields[2])
+			}
+			continue
+		}
+		out = append(out, line) // 兼容纯 IP/CIDR 行
+	}
+	return os.WriteFile(path, []byte(strings.Join(out, "\n")+"\n"), 0600)
 }
 
 // validBlocklist 校验下载的黑名单文件：大小下限 + 至少一行有效 IP/CIDR。

@@ -33,6 +33,10 @@ type Config struct {
 	LatestVersion  string   // 程序自动维护：每天 0 点检查 GitHub 后写入的最新版本号
 	TotalRejected     uint64 // 总计拒绝次数（历史累计）
 	TotalRejectedBase uint64 // 最近存档时对应的本次启动内核实时值（滚动基数）
+	OutboundAllow       bool  // 出站自动白名单开关（默认开）
+	OutboundPorts       []int // 放行端口（空 = 全部端口）
+	OutboundMinutes     int   // 普通远端时效分钟（默认 240）
+	OutboundBlackMinutes int  // 黑名单内远端时效分钟（默认 10）
 }
 
 var defaultPorts = []int{22, 21, 23, 25, 110, 135, 139, 143, 445, 1433, 3306, 3389, 5432, 5900, 6379, 8080, 8888, 9200, 11211, 27017}
@@ -49,6 +53,10 @@ func Default() *Config {
 		AllowStatic:  []string{"127.0.0.1/8", "::1"},
 		DataDir:      "auto",
 		DebugLog:     false,
+		OutboundAllow:       true,
+		OutboundPorts:       nil,
+		OutboundMinutes:     240,
+		OutboundBlackMinutes: 10,
 	}
 }
 
@@ -102,6 +110,17 @@ firehol.level1 = 0
 firehol.webserver = 0
 #被超过3个黑名单列表均收录的IP地址,黑名单质量高
 firehol.ipsum3 = 0
+##########################
+
+##########################
+# 出站自动白名单：服务器主动连接过的远端 IP,在时效内对其放行指定端口（不填则为全部端口）的新连接
+outbound.allow = 1
+# 放行端口（仅对自动白名单内 IP 生效）
+outbound.ports = 
+# 出站自动白名单时效（分钟）
+outbound.minutes = 240
+# 当远端IP处于黑名单时，自动白名单失效（分钟,避免误白长期放行）
+outbound.black.minutes = 10
 ##########################
 
 ##########################
@@ -291,6 +310,44 @@ func (c *Config) apply(key, val string) {
 	case "total.rejected.base":
 		if v, err := strconv.ParseUint(val, 10, 64); err == nil {
 			c.TotalRejectedBase = v
+		}
+	case "outbound.allow":
+		if v, ok := parseIntIn(val, 0, 1); ok {
+			c.OutboundAllow = v == 1
+		} else {
+			warnf("outbound.allow 值无效（需 0 或 1），使用默认 0")
+		}
+	case "outbound.ports":
+		if val == "" {
+			c.OutboundPorts = nil // 空 = 放行全部端口
+			return
+		}
+		if inc, exc, ok := parsePortRanges(val); ok && len(exc) == 0 {
+			if list := expandPorts(inc, nil); len(list) > 0 {
+				c.OutboundPorts = list
+			} else {
+				warnf("outbound.ports 值无效，使用默认（全部端口）")
+			}
+		} else {
+			warnf("outbound.ports 值无效，使用默认（全部端口）")
+		}
+	case "outbound.hours": // 旧键（小时），兼容转换
+		if v, ok := parseIntIn(val, 1, 30); ok {
+			c.OutboundMinutes = v * 60
+		} else {
+			warnf("outbound.hours 值无效，使用默认 240")
+		}
+	case "outbound.minutes":
+		if v, ok := parseIntIn(val, 1, 43200); ok {
+			c.OutboundMinutes = v
+		} else {
+			warnf("outbound.minutes 值无效（需 1-43200），使用默认 %d", c.OutboundMinutes)
+		}
+	case "outbound.black.minutes":
+		if v, ok := parseIntIn(val, 1, 43200); ok {
+			c.OutboundBlackMinutes = v
+		} else {
+			warnf("outbound.black.minutes 值无效（需 1-43200），使用默认 %d", c.OutboundBlackMinutes)
 		}
 	default:
 		warnf("未知配置项 %q 已忽略", key)

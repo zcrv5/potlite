@@ -56,21 +56,37 @@ cd /root/potlite && grep potlite-linux-amd64 /tmp/checksums.txt | sha256sum -c -
 
 ### 内置命令
 
-| 命令                          | 说明           |
-| --------------------------- | ------------ |
-| `potlite ban 1.2.3.4`      | 手动封禁指定 IP    |
-| `potlite unban 1.2.3.4`    | 解除封禁         |
-| `potlite allow 1.2.3.4`    | 加入白名单        |
-| `potlite disallow 1.2.3.4` | 移出白名单        |
-| `potlite bancount`         | 查看当前封禁 IP 数量 |
-| `potlite stat [N]`         | 本次启动拒绝次数 Top N 排行（默认前 10） |
-| `potlite stats [N]`        | 总计拒绝次数 Top N 排行（默认前 10；保存日志时才有累计，无日志时等同本次启动） |
-| `potlite port`             | 查看监听端口      |
-| `potlite info`             | 查看运行信息汇总     |
-| `potlite update`           | 检查并自动升级到最新版本 |
-| `potlite help`             | 显示命令说明      |
+**安装与管理**
 
-> 所有查看类命令（`info`/`stat`/`bancount`）支持 `--json` 输出，方便脚本集成。
+| 命令 | 说明 |
+| --- | --- |
+| `potlite install` | 一键安装为系统服务 |
+| `potlite uninstall` | 卸载（停服、清内核封禁、列出全部产物文件） |
+| `potlite update` | 检查并自动升级到最新版本 |
+| `potlite reload` | 重载配置 |
+| `potlite restart` | 重启服务 |
+| `potlite help` | 显示命令说明 |
+
+**信息查询**
+
+| 命令 | 说明 |
+| --- | --- |
+| `potlite info` | 查看运行信息（推荐使用） |
+| `potlite port` | 查看监听端口 |
+| `potlite bancount` | 当前封禁 IP 数量 |
+| `potlite stat [N]` | 本次启动拒绝次数 Top N 排行（默认前 10） |
+| `potlite stats [N]` | 总计拒绝次数 Top N 排行（保存日志时才有；无日志时等同本次启动） |
+
+**IP操作**
+
+| 命令 | 说明 |
+| --- | --- |
+| `potlite ban <IP>` | 封禁 IP |
+| `potlite unban <IP>` | 解封 IP |
+| `potlite allow <IP[/段]>` | 加入白名单 |
+| `potlite disallow <IP[/段]>` | 移出白名单 |
+
+> 所有查看类命令（`info`/`stat`/`stats`/`bancount`）支持 `--json` 输出，方便脚本集成。
 
 ### systemctl 命令
 

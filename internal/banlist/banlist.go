@@ -29,10 +29,11 @@ type List struct {
 }
 
 // group 一个黑名单组的当前状态（mtime+size 用于变化侦测，未变化跳过读取）。
+// entries 以 Prefix 存储（单 IP = /32 或 /128），支持 CIDR 段与包含匹配。
 type group struct {
-	ips   map[netip.Addr]struct{}
-	mtime time.Time
-	size  int64
+	entries map[netip.Prefix]struct{}
+	mtime   time.Time
+	size    int64
 }
 
 // New 创建名单（不加载）。bakPath 为备份文件路径（放程序所在目录，可自动回滚）。
@@ -157,7 +158,7 @@ func (l *List) Len() int {
 	defer l.mu.Unlock()
 	n := len(l.ips)
 	for _, g := range l.groups {
-		n += len(g.ips)
+		n += len(g.entries)
 	}
 	return n
 }
@@ -171,12 +172,15 @@ func (l *List) HasMain(ip netip.Addr) bool {
 }
 
 // InGroup 该地址是否属于某个黑名单组（组 IP 由文件管理，不进入主名单/主文件）。
+// 支持 CIDR 段包含匹配（如组内含 0.0.0.0/8，则 0.1.2.3 属于该组）。
 func (l *List) InGroup(ip netip.Addr) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, g := range l.groups {
-		if _, ok := g.ips[ip]; ok {
-			return true
+		for p := range g.entries {
+			if p.Contains(ip) {
+				return true
+			}
 		}
 	}
 	return false
@@ -209,9 +213,9 @@ func isExternal(name string) bool {
 	return true
 }
 
-// readExternal 读外部文件：返回条目集合与是否为"#整合"一次性导入模式（首行含 #整合）。
+// readExternal 读外部文件：返回条目集合（Prefix 形式，单 IP = /32 或 /128）与是否为"#整合"一次性导入模式。
 // 行解析失败静默跳过；# 注释行跳过。
-func readExternal(fp string) (map[netip.Addr]struct{}, bool, error) {
+func readExternal(fp string) (map[netip.Prefix]struct{}, bool, error) {
 	f, err := os.Open(fp)
 	if err != nil {
 		return nil, false, err
@@ -219,7 +223,7 @@ func readExternal(fp string) (map[netip.Addr]struct{}, bool, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	ips := make(map[netip.Addr]struct{})
+	entries := make(map[netip.Prefix]struct{})
 	first := true
 	integrate := false
 	for sc.Scan() {
@@ -235,12 +239,12 @@ func readExternal(fp string) (map[netip.Addr]struct{}, bool, error) {
 			continue
 		}
 		if a, err := netip.ParseAddr(line); err == nil {
-			ips[a] = struct{}{}
+			entries[netip.PrefixFrom(a, a.BitLen())] = struct{}{}
 		} else if p, err := netip.ParsePrefix(line); err == nil {
-			ips[p.Addr()] = struct{}{}
+			entries[p.Masked()] = struct{}{}
 		}
 	}
-	return ips, integrate, sc.Err()
+	return entries, integrate, sc.Err()
 }
 
 // ScanMerge 扫描数据目录中的外部黑名单文件，返回需要内核封禁/解封的地址（由调用方执行）：
@@ -248,7 +252,7 @@ func readExternal(fp string) (map[netip.Addr]struct{}, bool, error) {
 //   - 首行含"#整合"的文件：条目并入主名单并删除源文件（一次性导入）；
 //   - 其余文件作为黑名单组：文件为真相源——新增条目进 needBan、被删条目进 needUnban；
 //   - 组文件被删除：该组全部条目进 needUnban（解除封禁）。
-func (l *List) ScanMerge(dir string) (needBan, needUnban []netip.Addr, err error) {
+func (l *List) ScanMerge(dir string) (needBan, needUnban []netip.Prefix, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, nil, err
@@ -272,44 +276,44 @@ func (l *List) ScanMerge(dir string) (needBan, needUnban []netip.Addr, err error
 		if g, ok := l.groups[e.Name()]; ok && g.mtime.Equal(info.ModTime()) && g.size == info.Size() {
 			continue
 		}
-		ips, integrate, err := readExternal(fp)
+		cur, integrate, err := readExternal(fp)
 		if err != nil {
 			continue // 读失败容忍（如文件正在被写入）
 		}
 		if integrate {
 			// 一次性整合进主名单（由周期落盘写入 potlite.bans），完成后删除源文件
-			for a := range ips {
-				if _, dup := l.ips[a]; !dup {
-					l.ips[a] = struct{}{}
-					needBan = append(needBan, a)
+			for p := range cur {
+				if _, dup := l.ips[p.Addr()]; !dup {
+					l.ips[p.Addr()] = struct{}{}
+					needBan = append(needBan, p)
 				}
 			}
 			delete(l.groups, e.Name())
 			_ = os.Remove(fp)
 			continue
 		}
-		// 黑名单组：diff 新旧集合
-		var old map[netip.Addr]struct{}
+		// 黑名单组：diff 新旧集合（Prefix 对比）
+		var old map[netip.Prefix]struct{}
 		if g, ok := l.groups[e.Name()]; ok {
-			old = g.ips
+			old = g.entries
 		}
-		for a := range ips {
-			if _, existed := old[a]; !existed {
-				needBan = append(needBan, a)
+		for p := range cur {
+			if _, existed := old[p]; !existed {
+				needBan = append(needBan, p)
 			}
 		}
-		for a := range old {
-			if _, still := ips[a]; !still {
-				needUnban = append(needUnban, a)
+		for p := range old {
+			if _, still := cur[p]; !still {
+				needUnban = append(needUnban, p)
 			}
 		}
-		l.groups[e.Name()] = &group{ips: ips, mtime: info.ModTime(), size: info.Size()}
+		l.groups[e.Name()] = &group{entries: cur, mtime: info.ModTime(), size: info.Size()}
 	}
 	// 组文件被删除：该组全部解除
 	for name, g := range l.groups {
 		if !seen[name] {
-			for a := range g.ips {
-				needUnban = append(needUnban, a)
+			for p := range g.entries {
+				needUnban = append(needUnban, p)
 			}
 			delete(l.groups, name)
 		}
