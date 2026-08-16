@@ -31,6 +31,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 WatchdogSec=30
+LimitNOFILE=1048576
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=%s
@@ -59,7 +60,7 @@ func DoInstall() error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load(cfgPath)
+	cfg, _, err := config.Load(cfgPath)
 	if err != nil {
 		return fmt.Errorf("配置加载失败: %w", err)
 	}
@@ -123,7 +124,7 @@ func DoUninstall() error {
 	// 文件清单
 	cfgPath, _ := paths.ConfigPath()
 	exe, _ := os.Executable()
-	cfg, err := config.Load(cfgPath)
+	cfg, _, err := config.Load(cfgPath)
 	if err != nil {
 		cfg = config.Default()
 	}

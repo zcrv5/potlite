@@ -3,6 +3,7 @@
 package paths
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -31,9 +32,12 @@ func ConfigPath() (string, error) {
 	return filepath.Join(dir, "potlite.config"), nil
 }
 
-// DataDir 计算数据目录：auto → /root 可写则 /root，否则程序目录；显式绝对路径直接使用。
+// DataDir 计算数据目录：auto → /root 可写则 /root，否则程序目录；显式配置必须是绝对路径（S2 路径校验）。
 func DataDir(cfg *config.Config) (string, error) {
 	if cfg.DataDir != "" && cfg.DataDir != "auto" {
+		if !filepath.IsAbs(cfg.DataDir) {
+			return "", fmt.Errorf("data.dir 必须是绝对路径（当前值 %q）", cfg.DataDir)
+		}
 		return cfg.DataDir, nil
 	}
 	if isWritable("/root") {

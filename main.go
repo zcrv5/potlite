@@ -3,6 +3,8 @@
 package main
 
 import (
+	"bufio"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,8 +14,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,11 +51,18 @@ var defaultPorts = []int{22, 21, 23, 25, 110, 135, 139, 143, 445, 1433, 3306, 33
 var curCfg atomic.Pointer[config.Config]
 
 func main() {
+	// panic 兜底：崩溃时输出简洁错误，不留 core、不泄内部细节
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "potlite: 程序异常退出: %v\n", r)
+			os.Exit(1)
+		}
+	}()
 	// 统一版本号格式（goreleaser 注入的是 "v0.2.2"，比较与显示均不带 v）
 	version = strings.TrimPrefix(version, "v")
 	if len(os.Args) == 1 {
-		serve()
-		return
+		usage()
+		os.Exit(2)
 	}
 	if os.Geteuid() != 0 {
 		fmt.Fprintln(os.Stderr, "需要 root 权限，请使用 sudo potlite ...")
@@ -59,14 +70,18 @@ func main() {
 	}
 	arg := strings.TrimPrefix(os.Args[1], "-")
 	switch arg {
-	case "serve":
+	case "serve": // 隐藏命令（systemd 服务内部使用），不在用法说明展示
 		serve()
 	case "install":
 		must(install.DoInstall())
 	case "uninstall":
 		must(install.DoUninstall())
-	case "status":
-		status()
+	case "info":
+		infoCmd(hasJSON())
+	case "stat":
+		statCmd(hasJSON())
+	case "stats":
+		statsCmd(hasJSON())
 	case "update":
 		updateCmd()
 	case "ban", "unban", "allow", "disallow":
@@ -76,29 +91,42 @@ func main() {
 		}
 		manage(arg, os.Args[2])
 	case "bancount":
-		bancount()
-	case "potport":
-		potport()
+		bancount(hasJSON())
+	case "port":
+		portCmd()
+	case "help", "h":
+		usage()
+		os.Exit(0)
 	default:
 		usage()
 		os.Exit(2)
 	}
 }
 
+// hasJSON 检查命令行是否带 --json。
+func hasJSON() bool {
+	for _, a := range os.Args {
+		if a == "--json" {
+			return true
+		}
+	}
+	return false
+}
+
 func usage() {
-	fmt.Fprintln(os.Stderr, `PotLite（轻蜜罐）用法：
-  potlite                  启动服务（无参数 = serve）
-  potlite serve            启动服务（建立防火墙规则并常驻）
+	fmt.Fprintln(os.Stderr, `PotLite 轻蜜罐 使用方法：
   potlite install          一键安装为系统服务
   potlite uninstall        卸载（停服、清内核封禁、列出全部产物文件）
-  potlite status           查看运行状态
+  potlite info             查看运行信息
+  potlite stat [N]         本次启动拒绝次数 Top N 排行（默认前 10）
+  potlite stats [N]        总计拒绝次数 Top N 排行（保存日志时才有；无日志时等同本次启动）
   potlite update           检查并自动升级到最新版本
   potlite ban <IP>         封禁 IP
   potlite unban <IP>       解封 IP
   potlite allow <IP[/段]>      加入白名单
   potlite disallow <IP[/段]>   移出白名单
   potlite bancount         当前封禁 IP 数量
-  potlite potport          正在监听的端口`)
+  potlite port             查看监听端口`)
 }
 
 // ---------- update ----------
@@ -117,10 +145,38 @@ func updateCmd() {
 		return
 	}
 	fmt.Printf("发现新版本 v%s（当前 %s），正在下载…\n", latest, version)
-	url := fmt.Sprintf("https://github.com/zcrv5/potlite/releases/download/v%s/potlite-linux-%s", latest, runtime.GOARCH)
+	base := fmt.Sprintf("https://github.com/zcrv5/potlite/releases/download/v%s", latest)
+	// 1) 先取官方 checksums.txt 提取本架构哈希
+	wantHash := ""
+	csResp, err := http.Get(base + "/checksums.txt")
+	if err == nil {
+		if csBody, rerr := io.ReadAll(io.LimitReader(csResp.Body, 1<<20)); rerr == nil {
+			target := fmt.Sprintf("potlite-linux-%s", runtime.GOARCH)
+			for _, line := range strings.Split(string(csBody), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) == 2 && fields[1] == target {
+					wantHash = fields[0]
+					break
+				}
+			}
+		}
+		csResp.Body.Close()
+	}
+	if wantHash == "" {
+		fmt.Fprintln(os.Stderr, "potlite: 无法获取校验信息，升级中止（不信任未校验的下载）")
+		os.Exit(1)
+	}
+	// 2) 下载二进制并校验 sha256
+	url := base + fmt.Sprintf("/potlite-linux-%s", runtime.GOARCH)
 	tmp := exe + ".new"
 	if err := downloadFile(url, tmp); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 下载失败:", err)
+		os.Remove(tmp)
+		os.Exit(1)
+	}
+	got, err := sha256File(tmp)
+	if err != nil || got != wantHash {
+		fmt.Fprintln(os.Stderr, "potlite: 校验失败（文件与官方发布不一致），升级中止")
 		os.Remove(tmp)
 		os.Exit(1)
 	}
@@ -164,6 +220,20 @@ func latestVersion() (string, error) {
 	return strings.TrimPrefix(rel.TagName, "v"), nil
 }
 
+// sha256File 计算文件 SHA-256（十六进制小写）。
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
 // downloadFile 下载文件到目标路径。
 func downloadFile(url, dst string) error {
 	client := &http.Client{Timeout: 10 * time.Minute}
@@ -193,15 +263,52 @@ func newBanlist(dir string) *banlist.List {
 	return banlist.New(paths.BansFile(dir), bak)
 }
 
+// compactPorts 把端口列表压缩显示（连续段折叠：22, 80, 10000-20000）。
+func compactPorts(ports []int) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	sorted := append([]int(nil), ports...)
+	sort.Ints(sorted)
+	var parts []string
+	start, prev := sorted[0], sorted[0]
+	flush := func() {
+		if start == prev {
+			parts = append(parts, fmt.Sprint(start))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d-%d", start, prev))
+		}
+	}
+	for _, p := range sorted[1:] {
+		if p == prev+1 {
+			prev = p
+			continue
+		}
+		flush()
+		start, prev = p, p
+	}
+	flush()
+	return strings.Join(parts, ", ")
+}
+
 // ---------- serve ----------
 
 func serve() {
+	// 端口段可能达数万：提高文件描述符上限（默认 1024 不够）
+	var lim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &lim); err == nil && lim.Cur < lim.Max {
+		lim.Cur = lim.Max
+		_ = unix.Setrlimit(unix.RLIMIT_NOFILE, &lim)
+	}
 	if os.Geteuid() != 0 {
 		fmt.Fprintln(os.Stderr, "需要 root 权限，请使用 sudo potlite serve")
 		os.Exit(1)
 	}
-	cfg, cfgPath, err := loadCfg()
+	cfg, cfgPath, invalidKeys, err := loadCfg()
 	must(err)
+	if len(invalidKeys) > 0 {
+		fmt.Fprintf(os.Stderr, "potlite: 警告: 配置中存在失效设置项（已按默认值运行）: %s\n", strings.Join(invalidKeys, ", "))
+	}
 	curCfg.Store(cfg)
 	dir, err := paths.DataDir(cfg)
 	must(err)
@@ -231,6 +338,8 @@ func serve() {
 		fmt.Fprintln(os.Stderr, "potlite: 警告:", err)
 	}
 	must(fw.ReplayBans(bl.Snapshot()))
+	// FireHOL 在线黑名单：先下载再扫描（保证启动即收录）
+	syncFirehol(cfg, dir)
 	// 外部黑名单：一次性整合（#整合 文件）/ 黑名单组加载 → 内核同步
 	if needBan, _, err := bl.ScanMerge(dir); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 外部名单扫描失败:", err)
@@ -253,6 +362,9 @@ func serve() {
 
 	// CSV 日志（级别 1：IP、被拒总数、首次/最新拒绝时间；数据源为内核 counter dump）
 	cl := csvlog.New(paths.CSVFile(dir), cfg.LogLevel)
+	if err := cl.Load(); err != nil {
+		fmt.Fprintln(os.Stderr, "potlite: CSV 日志恢复失败:", err)
+	}
 
 	// 蜜罐监听（accept 兜底）；hp 变量可被 SIGHUP 重建
 	banFn := func(ip netip.Addr) error {
@@ -367,30 +479,22 @@ func serve() {
 	go func() {
 		for {
 			c := curCfg.Load()
-			parts := make([]string, len(c.Ports))
-			for i, p := range c.Ports {
-				parts[i] = fmt.Sprint(p)
-			}
 			// 绑定失败端口（无失败则不显示该前缀）
 			prefix := ""
 			if v := failedPorts.Load(); v != nil {
 				if fps := v.([]int); len(fps) > 0 {
-					ps := make([]string, len(fps))
-					for i, p := range fps {
-						ps[i] = fmt.Sprint(p)
-					}
-					prefix = "绑定失败端口: " + strings.Join(ps, ", ") + " | "
+					prefix = "绑定失败端口: " + compactPorts(fps) + " | "
 				}
 			}
 			nt.Status([]string{
-				prefix + fmt.Sprintf("监听端口: %s | 封禁 IP 数: %d", strings.Join(parts, ", "), bl.Len()),
+				prefix + fmt.Sprintf("监听端口: %s | 封禁 IP 数: %d", compactPorts(c.Ports), bl.Len()),
 			})
 			nt.Watchdog()
 			time.Sleep(10 * time.Second)
 		}
 	}()
 
-	// 每天 0 点检查一次新版本（结果写回配置 latest.version，供 status 显示）
+	// 每天 0 点检查一次新版本（结果写回配置 latest.version，供 info 显示）+ FireHOL 黑名单同步
 	checkLatest(cfgPath)
 	go func() {
 		for {
@@ -398,6 +502,7 @@ func serve() {
 			next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 1, 0, now.Location())
 			time.Sleep(next.Sub(now))
 			checkLatest(cfgPath)
+			syncFirehol(curCfg.Load(), dir)
 		}
 	}()
 
@@ -408,7 +513,7 @@ func serve() {
 	var totalBase atomic.Uint64
 	totalSaved.Store(cfg.TotalRejected)
 	totalBase.Store(0)
-	if err := config.UpdateKeys(cfgPath, map[string]string{"total.rejected.base": "0"}); err != nil {
+	if _, err := config.WriteBack(cfgPath, map[string]string{"total.rejected.base": "0"}); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 拒绝计数基数重置失败:", err)
 	}
 	rollTotal := func() {
@@ -416,7 +521,7 @@ func serve() {
 		saved := totalSaved.Load() + (cur - totalBase.Load())
 		totalSaved.Store(saved)
 		totalBase.Store(cur)
-		if err := config.UpdateKeys(cfgPath, map[string]string{
+		if _, err := config.WriteBack(cfgPath, map[string]string{
 			"total.rejected":      strconv.FormatUint(saved, 10),
 			"total.rejected.base": strconv.FormatUint(cur, 10),
 		}); err != nil {
@@ -460,10 +565,13 @@ func serve() {
 // reload SIGHUP 热重载：重读配置 → 端口集合更新 → 蜜罐重绑 → 白名单对齐 → 日志级别切换。
 func reload(cfgPath, dir string, fw *nftfw.FW, bl *banlist.List,
 	wlSet *map[netip.Prefix]struct{}, startHP func() []int, cl *csvlog.Log) {
-	newCfg, err := config.Load(cfgPath)
+	newCfg, invalidKeys, err := config.Load(cfgPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 重载失败（配置读取错误）:", err)
 		return
+	}
+	if len(invalidKeys) > 0 {
+		fmt.Fprintf(os.Stderr, "potlite: 警告: 配置中存在失效设置项（已按默认值运行）: %s\n", strings.Join(invalidKeys, ", "))
 	}
 	curCfg.Store(newCfg)
 	fmt.Println("potlite: 配置已热重载")
@@ -493,10 +601,28 @@ var (
 	dlogMu   sync.Mutex
 )
 
+// sanitize S1 日志注入防护：外部输入进入日志前剥离控制字符（换行/制表符保留空格语义）。
+func sanitize(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			b.WriteByte(' ')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func dlogf(dir, format string, args ...interface{}) {
 	c := curCfg.Load()
 	if c == nil || !c.DebugLog {
 		return
+	}
+	for i := range args {
+		if s, ok := args[i].(string); ok {
+			args[i] = sanitize(s)
+		}
 	}
 	dlogMu.Lock()
 	defer dlogMu.Unlock()
@@ -587,7 +713,7 @@ func localIPs() []netip.Addr {
 // ---------- CLI 管理命令（内核 + 文件同步，与服务进程同一份逻辑） ----------
 
 func manage(cmd, arg string) {
-	cfg, _, err := loadCfg()
+	cfg, _, _, err := loadCfg()
 	must(err)
 	dir, err := paths.DataDir(cfg)
 	must(err)
@@ -626,36 +752,57 @@ func manage(cmd, arg string) {
 	}
 }
 
-func bancount() {
-	cfg, _, err := loadCfg()
+func bancount(jsonOut bool) {
+	cfg, _, _, err := loadCfg()
 	must(err)
 	dir, err := paths.DataDir(cfg)
 	must(err)
 	bl := newBanlist(dir)
 	must(bl.Load())
+	if jsonOut {
+		printJSON(map[string]any{"banned": bl.Len()})
+		return
+	}
 	fmt.Printf("当前封禁 IP 数量：%d\n", bl.Len())
 }
 
-func potport() {
-	cfg, _, err := loadCfg()
+// portCmd 查看监听端口（与 info 的端口部分一致：已监听 + 失败时的绑定失败端口）。
+func portCmd() {
+	cfg, _, _, err := loadCfg()
 	must(err)
-	parts := make([]string, len(cfg.Ports))
-	for i, p := range cfg.Ports {
-		parts[i] = fmt.Sprint(p)
+	ok := listeningPorts()
+	var okList, failList []int
+	for _, p := range cfg.Ports {
+		if ok[p] {
+			okList = append(okList, p)
+		} else {
+			failList = append(failList, p)
+		}
 	}
-	fmt.Printf("正在监听的端口：%s\n", strings.Join(parts, ", "))
+	fmt.Printf("已监听端口:  %s\n", compactPorts(okList))
+	if len(failList) > 0 {
+		fmt.Printf("绑定失败端口: %s\n", compactPorts(failList))
+	}
 }
 
-// status 运行状态汇总。
-func status() {
-	cfg, cfgPath, err := loadCfg()
+// infoCmd 运行信息汇总（数据目录在配置上方；存在失效设置项时在配置行下方列出）。
+func infoCmd(jsonOut bool) {
+	cfg, cfgPath, invalid, err := loadCfg()
 	if err != nil {
-		fmt.Printf("PotLite 状态\n")
+		if jsonOut {
+			printJSON(map[string]any{"error": err.Error()})
+			return
+		}
+		fmt.Printf("PotLite 轻蜜罐 信息\n")
 		fmt.Printf("  运行状态: 配置读取失败: %v\n", err)
 		return
 	}
 	dir, err := paths.DataDir(cfg)
 	if err != nil {
+		if jsonOut {
+			printJSON(map[string]any{"error": err.Error()})
+			return
+		}
 		fmt.Printf("  数据目录计算失败: %v\n", err)
 		return
 	}
@@ -664,37 +811,201 @@ func status() {
 	wf := whitelist.New(paths.WhitelistFile(dir))
 	items, _ := wf.Load()
 
-	fmt.Println("PotLite 轻蜜罐 状态")
-	fmt.Printf("  当前版本:  %s\n", versionLine(cfg))
-	fmt.Printf("  运行状态:  %s\n", serviceState())
 	// 实际监听检测：配置端口 vs ss 查询到的 potlite 实际监听端口
 	ok := listeningPorts()
-	var okList, failList []string
+	var okList, failList []int
 	for _, p := range cfg.Ports {
 		if ok[p] {
-			okList = append(okList, strconv.Itoa(p))
+			okList = append(okList, p)
 		} else {
-			failList = append(failList, strconv.Itoa(p))
+			failList = append(failList, p)
 		}
 	}
-	fmt.Printf("  已监听端口:  %s\n", strings.Join(okList, ", "))
-	if len(failList) > 0 {
-		fmt.Printf("  绑定失败端口: %s\n", strings.Join(failList, ", "))
-	}
-	fmt.Printf("  封禁 IP 数: %d\n", bl.Len())
+	var curRej, totalRej uint64
 	if fw2, err := nftfw.New(); err == nil {
 		if err := fw2.Attach(); err == nil {
-			cur := fw2.TotalRejected()
-			fmt.Printf("  本次启动拒绝次数: %d\n", cur)
-			fmt.Printf("  总计拒绝次数: %d\n", cfg.TotalRejected+(cur-cfg.TotalRejectedBase))
+			curRej = fw2.TotalRejected()
+			totalRej = cfg.TotalRejected + (curRej - cfg.TotalRejectedBase)
 		}
 		fw2.Close()
 	}
+
+	if jsonOut {
+		printJSON(map[string]any{
+			"version":          versionLine(cfg),
+			"service":          serviceState(),
+			"listening_ports":  okList,
+			"failed_ports":     failList,
+			"banned":           bl.Len(),
+			"rejected_current": curRej,
+			"rejected_total":   totalRej,
+			"whitelist":        len(items),
+			"log_enabled":      cfg.LogLevel >= 1,
+			"debug_log":        cfg.DebugLog,
+			"data_dir":         dir,
+			"config":           cfgPath,
+			"invalid_keys":     invalid,
+		})
+		return
+	}
+
+	fmt.Println("PotLite 轻蜜罐 信息")
+	fmt.Printf("  当前版本:  %s\n", versionLine(cfg))
+	fmt.Printf("  运行状态:  %s\n", serviceState())
+	fmt.Printf("  已监听端口:  %s\n", compactPorts(okList))
+	if len(failList) > 0 {
+		fmt.Printf("  绑定失败端口: %s\n", compactPorts(failList))
+	}
+	fmt.Printf("  封禁 IP 数: %d\n", bl.Len())
+	fmt.Printf("  本次启动拒绝次数: %d\n", curRej)
+	fmt.Printf("  总计拒绝次数: %d\n", totalRej)
 	fmt.Printf("  白名单条目: %d\n", len(items))
 	fmt.Printf("  日志开关:  %s\n", onoff(cfg.LogLevel >= 1))
 	fmt.Printf("  debug日志开关: %s\n", onoff(cfg.DebugLog))
-	fmt.Printf("  配置:      %s\n", cfgPath)
 	fmt.Printf("  数据目录:  %s\n", dir)
+	fmt.Printf("  配置:      %s\n", cfgPath)
+	if len(invalid) > 0 {
+		fmt.Printf("  失效设置项: %s\n", strings.Join(invalid, ", "))
+	}
+}
+
+// statCmd 拒绝次数 Top N 排行（默认前 10；数据源为内核元素 counter）。
+func statCmd(jsonOut bool) {
+	n := 10
+	if len(os.Args) >= 3 {
+		if v, err := strconv.Atoi(os.Args[2]); err == nil && v > 0 {
+			n = v
+		}
+	}
+	fw, err := nftfw.New()
+	if err != nil {
+		if jsonOut {
+			printJSON(map[string]any{"error": err.Error()})
+			return
+		}
+		must(err)
+	}
+	defer fw.Close()
+	if err := fw.Attach(); err != nil {
+		if jsonOut {
+			printJSON(map[string]any{"error": err.Error()})
+			return
+		}
+		must(err)
+	}
+	counters := fw.ListBannedCounters()
+	type item struct {
+		IP     string `json:"ip"`
+		Reject uint64 `json:"reject"`
+	}
+	list := make([]item, 0, len(counters))
+	for ip, cnt := range counters {
+		list = append(list, item{ip, cnt})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Reject > list[j].Reject })
+	if len(list) > n {
+		list = list[:n]
+	}
+	if jsonOut {
+		printJSON(map[string]any{"top": list})
+		return
+	}
+	if len(list) == 0 {
+		fmt.Println("暂无封禁数据")
+		return
+	}
+	for _, it := range list {
+		fmt.Printf("%s 拒绝次数%d\n", it.IP, it.Reject)
+	}
+}
+
+// statsCmd 总计拒绝次数 Top N 排行（默认前 10；数据源：CSV 日志的累计计数）。
+// 无 CSV（日志开关关闭）时降级为内核 counter（等同本次启动的 stat）。
+func statsCmd(jsonOut bool) {
+	n := 10
+	if len(os.Args) >= 3 {
+		if v, err := strconv.Atoi(os.Args[2]); err == nil && v > 0 {
+			n = v
+		}
+	}
+	type item struct {
+		IP     string `json:"ip"`
+		Reject uint64 `json:"reject"`
+	}
+	outTop := func(list []item) {
+		sort.Slice(list, func(i, j int) bool { return list[i].Reject > list[j].Reject })
+		if len(list) > n {
+			list = list[:n]
+		}
+		if jsonOut {
+			printJSON(map[string]any{"top": list})
+			return
+		}
+		if len(list) == 0 {
+			fmt.Println("暂无数据")
+			return
+		}
+		for _, it := range list {
+			fmt.Printf("%s 拒绝次数%d\n", it.IP, it.Reject)
+		}
+	}
+
+	cfg, _, _, err := loadCfg()
+	if err != nil {
+		if jsonOut {
+			printJSON(map[string]any{"error": err.Error()})
+			return
+		}
+		must(err)
+	}
+	dir, err := paths.DataDir(cfg)
+	must(err)
+	f, err := os.Open(paths.CSVFile(dir))
+	if err != nil {
+		// 无 CSV（日志开关关闭）：降级为内核 counter（等同本次启动）
+		if fw2, err2 := nftfw.New(); err2 == nil {
+			if err2 := fw2.Attach(); err2 == nil {
+				var list []item
+				for ip, cnt := range fw2.ListBannedCounters() {
+					list = append(list, item{ip, cnt})
+				}
+				outTop(list)
+			}
+			fw2.Close()
+			return
+		}
+		if jsonOut {
+			printJSON(map[string]any{"error": err.Error()})
+			return
+		}
+		must(err)
+	}
+	defer f.Close()
+	var list []item
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		fields := strings.Split(sc.Text(), ",")
+		if len(fields) < 2 {
+			continue
+		}
+		v, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		list = append(list, item{fields[0], v})
+	}
+	outTop(list)
+}
+
+// printJSON 标准 JSON 单行输出。
+func printJSON(v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "potlite:", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(b))
 }
 
 // listeningPorts 通过 ss 查询 potlite 进程实际监听的 TCP 端口。
@@ -731,12 +1042,84 @@ func checkLatest(cfgPath string) {
 	if err != nil || latest == "" {
 		latest = version
 	}
-	if err := config.UpdateKeys(cfgPath, map[string]string{"latest.version": latest}); err != nil {
+	if _, err := config.WriteBack(cfgPath, map[string]string{"latest.version": latest}); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 写入最新版本配置失败:", err)
 	}
 	if latest != version {
 		fmt.Printf("potlite: 发现新版本 v%s（当前 %s），运行 potlite update 升级\n", latest, version)
 	}
+}
+
+// ---------- FireHOL 在线黑名单 ----------
+
+const fireholBase = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/"
+
+// fireholSources 配置开关 → 远端文件 → 本地文件名（黑名单组机制自动收录）。
+var fireholSources = []struct {
+	enabled func(*config.Config) bool
+	remote  string
+	local   string
+}{
+	{func(c *config.Config) bool { return c.FireholLevel1 }, "firehol_level1.netset", "potlite.bans.firehol.level1"},
+	{func(c *config.Config) bool { return c.FireholWeb }, "firehol_webserver.netset", "potlite.bans.firehol.webserver"},
+	{func(c *config.Config) bool { return c.FireholIpsum3 }, "ipsum_3.netset", "potlite.bans.firehol.ipsum3"},
+}
+
+// syncFirehol 按配置下载/清理 FireHOL 黑名单（启动时 + 每天 0 点调用）。
+// 下载 → 校验（大小下限 + 有效 IP 行）→ 原子替换；失败保留旧文件；未启用的项删除程序代管文件。
+func syncFirehol(cfg *config.Config, dir string) {
+	for _, src := range fireholSources {
+		local := filepath.Join(dir, src.local)
+		if !src.enabled(cfg) {
+			_ = os.Remove(local)
+			continue
+		}
+		tmp := local + ".tmp"
+		if err := downloadFile(fireholBase+src.remote, tmp); err != nil {
+			fmt.Fprintf(os.Stderr, "potlite: FireHOL %s 下载失败（保留旧文件）: %v\n", src.remote, err)
+			_ = os.Remove(tmp)
+			continue
+		}
+		if !validBlocklist(tmp) {
+			fmt.Fprintf(os.Stderr, "potlite: FireHOL %s 校验失败（文件异常），保留旧文件\n", src.remote)
+			_ = os.Remove(tmp)
+			continue
+		}
+		_ = os.Chmod(tmp, 0600)
+		if err := os.Rename(tmp, local); err == nil {
+			fmt.Printf("potlite: FireHOL 黑名单已更新：%s\n", src.remote)
+		} else {
+			_ = os.Remove(tmp)
+		}
+	}
+}
+
+// validBlocklist 校验下载的黑名单文件：大小下限 + 至少一行有效 IP/CIDR。
+func validBlocklist(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil || st.Size() < 10*1024 {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if _, err := netip.ParseAddr(line); err == nil {
+			return true
+		}
+		if _, err := netip.ParsePrefix(line); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // onoff 开关显示。
@@ -762,16 +1145,22 @@ func runOut(name string, args ...string) (string, error) {
 
 // ---------- 辅助 ----------
 
-func loadCfg() (*config.Config, string, error) {
+func loadCfg() (*config.Config, string, []string, error) {
 	cfgPath, err := paths.ConfigPath()
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
-	cfg, err := config.Load(cfgPath)
+	cfg, invalid, err := config.Load(cfgPath)
 	if err != nil {
-		return nil, "", err
+		return nil, "", invalid, err
 	}
-	return cfg, cfgPath, nil
+	// S4：配置文件属主/权限校验（可被非 root 改写 = 白名单投毒风险）
+	if st, err := os.Stat(cfgPath); err == nil {
+		if st.Mode().Perm()&0o022 != 0 {
+			fmt.Fprintln(os.Stderr, "potlite: 警告: 配置文件权限过宽（建议 0600），存在被改写风险")
+		}
+	}
+	return cfg, cfgPath, invalid, nil
 }
 
 func mustIP(s string) netip.Addr {

@@ -39,6 +39,16 @@ chmod +x /root/potlite/potlite
 /root/potlite/potlite uninstall
 ```
 
+### 校验下载（可选）
+
+每次发布都附带官方校验文件，可验证下载的二进制未被篡改：
+
+```bash
+curl -sSL https://github.com/zcrv5/potlite/releases/latest/download/checksums.txt -o /tmp/checksums.txt
+cd /root/potlite && grep potlite-linux-amd64 /tmp/checksums.txt | sha256sum -c -
+# 输出 "potlite: OK" 即校验通过
+```
+
 
 ***
 
@@ -53,18 +63,50 @@ chmod +x /root/potlite/potlite
 | `potlite allow 1.2.3.4`    | 加入白名单        |
 | `potlite disallow 1.2.3.4` | 移出白名单        |
 | `potlite bancount`         | 查看当前封禁 IP 数量 |
-| `potlite potport`          | 查看正在监听的端口    |
-| `potlite status`           | 查看运行状态汇总     |
+| `potlite stat [N]`         | 本次启动拒绝次数 Top N 排行（默认前 10） |
+| `potlite stats [N]`        | 总计拒绝次数 Top N 排行（默认前 10；保存日志时才有累计，无日志时等同本次启动） |
+| `potlite port`             | 查看监听端口      |
+| `potlite info`             | 查看运行信息汇总     |
 | `potlite update`           | 检查并自动升级到最新版本 |
+| `potlite help`             | 显示命令说明      |
+
+> 所有查看类命令（`info`/`stat`/`bancount`）支持 `--json` 输出，方便脚本集成。
 
 ### systemctl 命令
 
 | 命令                          | 说明                        |
 | --------------------------- | ------------------------- |
-| `systemctl status potlite` | 查看状态（含监听端口和封禁 IP 数量；完整详情推荐使用 `potlite status`） |
+| `systemctl status potlite` | 查看状态（含监听端口和封禁 IP 数量；完整详情推荐使用 `potlite info`） |
 | `systemctl reload potlite`  | 修改配置后热重载（服务不中断）           |
 | `systemctl restart potlite` | 重启服务                      |
 | `systemctl stop potlite`    | 停止服务                      |
+
+### 真实运行输出
+
+安装正确时，你会看到类似输出（这就是 potlite 正常工作的样子）：
+
+```bash
+$ potlite info
+PotLite 轻蜜罐 信息
+  当前版本:  0.3.2
+  运行状态:  active
+  已监听端口:  21-23, 25, 110, 135, 139, 143, 445, 1433, 3306, 3389, 5432, 5900, 6379, 8080, 8888, 9200, 11211, 27017
+  封禁 IP 数: 2618
+  本次启动拒绝次数: 0
+  总计拒绝次数: 3145
+  白名单条目: 4
+  日志开关:  开
+  debug日志开关: 关
+  数据目录:  /root
+  配置:      /root/potlite/potlite.config
+
+$ potlite stat 5
+205.210.31.170 拒绝次数200
+45.156.129.95 拒绝次数183
+66.148.126.142 拒绝次数77
+170.155.12.20 拒绝次数55
+223.96.213.162 拒绝次数31
+```
 
 ***
 
@@ -85,8 +127,13 @@ chmod +x /root/potlite/potlite
 | `allow.static`  | 127.0.0.1/8,::1 | 静态白名单                               |
 | `data.dir`      | auto            | 数据目录（auto = /root 可写则 /root，否则程序目录） |
 | `debug.log` | 0 | 排障日志开关 |
+| `firehol.level1` | 0 | FireHOL level1 在线黑名单（基础黑名单，误封率极低，推荐） |
+| `firehol.webserver` | 0 | FireHOL webserver 在线黑名单（服务器有 web 服务时推荐） |
+| `firehol.ipsum3` | 0 | FireHOL ipsum_3 在线黑名单（被 3 个以上名单共识收录，质量高） |
 
 另有三个程序自动维护的字段（`latest.version` 最新版本、`total.rejected` 总计拒绝次数、`total.rejected.base` 计数基数），无需手动修改。
+
+FireHOL 说明：置 1 即启用，程序每天 0 点自动下载对应名单（如 `firehol.level1=1` 下载 level1 并保存为 `potlite.bans.firehol.level1`），随即自动生效；下载失败自动保留上一份，不影响其它功能。
 
 ### 数据文件
 

@@ -1,29 +1,36 @@
-// Package config 实现 potlite.config 的解析与默认配置生成。
+// Package config 实现 potlite.config 的解析、生成与模板同步。
 // 解析规则（对小白宽容）：等号前后空格无影响；空行跳过；行首 # 为注释；
 // 键名大小写不敏感；未知键警告后忽略；兼容 CRLF；非法值回退默认并警告。
+//
+// 配置文件按"设置块"组织：每块用 ########################## 上下包裹。
+// 版本升级时以新模板为准重写（注释替换为最新、用户的变量值保留、
+// 模板新增键自动补入、模板已移除的键列入失效清单并不再写回）。
 package config
 
 import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
 
 // Config 全部配置项。
 type Config struct {
-	Ports        []int    // 蜜罐监听端口
-	IntervalBans int      // bans 落盘间隔（分钟）
-	IntervalLog  int      // CSV 落盘间隔（分钟）
-	IntervalDdns int      // DDNS 解析间隔（分钟）
-	LogLevel     int      // 日志级别 0-1
-	DdnsDomains  []string // DDNS 白名单域名
-	AllowStatic  []string // 静态白名单 IP/CIDR
-	DataDir      string   // auto 或绝对路径
-	DebugLog     bool     // debug 日志开关
-	LatestVersion string  // 程序自动维护：每天 0 点检查 GitHub 后写入的最新版本号
-	// 拒绝计数（程序自动维护，每 10 分钟更新）：
+	Ports          []int    // 蜜罐监听端口
+	IntervalBans   int      // bans 落盘间隔（分钟）
+	IntervalLog    int      // CSV 落盘间隔（分钟）
+	IntervalDdns   int      // DDNS 解析间隔（分钟）
+	LogLevel       int      // 日志级别 0-1
+	DdnsDomains    []string // DDNS 白名单域名
+	AllowStatic    []string // 静态白名单 IP/CIDR
+	DataDir        string   // auto 或绝对路径
+	DebugLog       bool     // debug 日志开关
+	FireholLevel1  bool     // FireHOL level1 黑名单
+	FireholWeb     bool     // FireHOL webserver 黑名单
+	FireholIpsum3  bool     // FireHOL ipsum_3 黑名单
+	LatestVersion  string   // 程序自动维护：每天 0 点检查 GitHub 后写入的最新版本号
 	TotalRejected     uint64 // 总计拒绝次数（历史累计）
 	TotalRejectedBase uint64 // 最近存档时对应的本次启动内核实时值（滚动基数）
 }
@@ -45,58 +52,86 @@ func Default() *Config {
 	}
 }
 
-// DefaultTemplate 生成默认配置文件时写入的完整内容（含中文注释）。
-const DefaultTemplate = `# PotLite（轻蜜罐）配置文件
+// DefaultTemplate 完整配置模板（按设置块组织，含中文注释）。
+// 版本升级时程序以本模板为准重写配置文件（保留用户值）。
+const DefaultTemplate = `# PotLite 轻蜜罐配置文件
 # 修改后执行 systemctl reload potlite 热重载生效
 
-# 蜜罐监听端口（逗号分隔，可增删）
+##########################
+# 蜜罐监听端口(逗号分隔)。支持端口段(如 100-300,500-300)与排除(如 -80 , -80--90)
+# 默认20个端口为 22,21,23,25,110,135,139,143,445,1433,3306,3389,5432,5900,6379,8080,8888,9200,11211,27017
 ports = 22,21,23,25,110,135,139,143,445,1433,3306,3389,5432,5900,6379,8080,8888,9200,11211,27017
+##########################
 
-# 封禁名单保存间隔（单位：分钟）
+##########################
+# 封禁名单(potlite.bans)保存间隔(单位:分钟)
 interval.bans = 1
+##########################
 
-# 日志级别：0=不记录（默认值） 1=记录（IP、拒绝次数、首次封禁时间、最近封禁时间）
+##########################
+# 日志开关:0=不记录(默认值) 1=记录(保存为potlite.log.csv,内容为:IP、拒绝次数、首次封禁时间、最近封禁时间)
 log.level = 0
-# 日志保存间隔（单位：分钟）
+# 日志保存间隔(单位:分钟)
 interval.log = 10
-
-# DDNS 白名单域名（逗号分隔，留空则只使用静态白名单）
-ddns.domains = 
-# 域名重新解析间隔（单位：分钟）
-interval.ddns = 120
-
-# 静态白名单 IP/CIDR（逗号分隔）
-allow.static = 127.0.0.1/8,::1
-
-# 数据目录：auto=自动（/root 可写则 /root，否则程序目录）；也可填写绝对路径
-data.dir = auto
-
-# debug 日志开关：0=不记录（默认） 1=记录程序运行细节（排障时开启）
+# debug日志开关:0=不记录(默认) 1=记录程序运行细节(排障时开启)
 debug.log = 0
+##########################
 
-# 最新版本（程序每天 0 点自动检查并更新，无需手动修改）
+##########################
+# DDNS 白名单域名(逗号分隔,留空则只使用静态白名单)
+ddns.domains = 
+# 域名重新解析间隔(单位:分钟)
+interval.ddns = 120
+##########################
+
+##########################
+# 静态白名单 IP/CIDR(逗号分隔)
+allow.static = 127.0.0.1/8,::1
+##########################
+
+##########################
+# 数据目录:auto=自动(/root 可写则 /root,否则程序目录)；也可填写绝对路径
+data.dir = auto
+##########################
+
+##########################
+#来自于FireHOL的在线黑名单,根据需求使用,0=不启用(默认),1=启用,每日0点自动更新。
+#level1,基础黑名单,误封率低,推荐使用。
+firehol.level1 = 0
+#当服务器有web服务时推荐
+firehol.webserver = 0
+#被超过3个黑名单列表均收录的IP地址,黑名单质量高
+firehol.ipsum3 = 0
+##########################
+
+##########################
+# 系统使用字段,请勿手工修改
 latest.version = 
-
-# 拒绝计数（程序自动维护，每 10 分钟更新，无需手动修改）
 total.rejected = 0
 total.rejected.base = 0
+##########################
 `
 
 // Load 读取配置文件；文件不存在时先生成默认配置再使用。
-func Load(path string) (*Config, error) {
+// 返回的 invalidKeys 为"旧配置中存在但当前版本已不支持"的键列表（程序按默认值运行）。
+func Load(path string) (*Config, []string, error) {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if werr := os.WriteFile(path, []byte(DefaultTemplate), 0600); werr != nil {
+			return nil, nil, fmt.Errorf("生成默认配置失败: %w", werr)
+		}
+		return Default(), nil, nil
+	}
+	// 以模板为准重写（保留用户值），得到失效键清单
+	invalid, err := WriteBack(path, nil)
+	if err != nil {
+		return nil, nil, err
+	}
 	cfg := Default()
 	f, err := os.Open(path)
-	if os.IsNotExist(err) {
-		if werr := os.WriteFile(path, []byte(DefaultTemplate), 0600); werr != nil {
-			return nil, fmt.Errorf("生成默认配置失败: %w", werr)
-		}
-		f, err = os.Open(path)
-	}
 	if err != nil {
-		return nil, err
+		return nil, invalid, err
 	}
 	defer f.Close()
-
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 256*1024)
 	for sc.Scan() {
@@ -113,14 +148,89 @@ func Load(path string) (*Config, error) {
 		val := strings.TrimSpace(line[eq+1:])
 		cfg.apply(key, val)
 	}
-	return cfg, sc.Err()
+	return cfg, invalid, sc.Err()
+}
+
+// WriteBack 以模板为准重写配置文件：注释替换为最新、用户的变量值保留、
+// 模板新增键自动补入、模板已移除的键列入失效清单（不再写回）。
+// kvs 为额外要写入的值（程序自动维护字段用）。返回失效键列表。
+func WriteBack(path string, kvs map[string]string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	userVals := extractKeyValues(string(data))
+	tmplKeys := extractKeyValues(DefaultTemplate)
+	// 失效键：现有文件有、模板没有
+	var invalid []string
+	for k := range userVals {
+		if _, ok := tmplKeys[k]; !ok {
+			invalid = append(invalid, k)
+		}
+	}
+	sort.Strings(invalid)
+	// 合并额外值
+	for k, v := range kvs {
+		userVals[k] = v
+	}
+	// 模板重写 + 回填用户值
+	out := DefaultTemplate
+	for k, v := range userVals {
+		if _, ok := tmplKeys[k]; !ok {
+			continue // 失效键不写回
+		}
+		out = replaceKeyValue(out, k, v)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(out), 0600); err != nil {
+		return invalid, err
+	}
+	return invalid, os.Rename(tmp, path)
+}
+
+// extractKeyValues 从文本中提取所有"键 = 值"（非注释行，键名小写）。
+func extractKeyValues(text string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		eq := strings.Index(trimmed, "=")
+		if eq <= 0 || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		k := strings.ToLower(strings.TrimSpace(trimmed[:eq]))
+		out[k] = strings.TrimSpace(trimmed[eq+1:])
+	}
+	return out
+}
+
+// replaceKeyValue 在文本中把指定键的值行替换为 "键 = 值"（保持缩进）。
+func replaceKeyValue(text, key, val string) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		eq := strings.Index(trimmed, "=")
+		if eq <= 0 || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(trimmed[:eq])) == key {
+			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			lines[i] = indent + key + " = " + val
+			break
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (c *Config) apply(key, val string) {
 	switch key {
 	case "ports":
-		if list, ok := parseIntList(val); ok && len(list) > 0 {
-			c.Ports = list
+		if inc, exc, ok := parsePortRanges(val); ok {
+			list := expandPorts(inc, exc)
+			if len(list) > 0 {
+				c.Ports = list
+			} else {
+				warnf("ports 展开后为空，使用默认端口")
+			}
 		} else {
 			warnf("ports 值无效，使用默认端口")
 		}
@@ -164,6 +274,12 @@ func (c *Config) apply(key, val string) {
 		} else {
 			warnf("debug.log 值无效（需 0 或 1），使用默认 0")
 		}
+	case "firehol.level1":
+		c.FireholLevel1 = val == "1"
+	case "firehol.webserver":
+		c.FireholWeb = val == "1"
+	case "firehol.ipsum3":
+		c.FireholIpsum3 = val == "1"
 	case "latest.version":
 		if val != "" {
 			c.LatestVersion = val
@@ -193,20 +309,76 @@ func splitList(val string) []string {
 	return out
 }
 
-func parseIntList(val string) ([]int, bool) {
-	parts := splitList(val)
-	if len(parts) == 0 {
-		return nil, false
-	}
-	out := make([]int, 0, len(parts))
-	for _, p := range parts {
-		v, err := strconv.Atoi(p)
-		if err != nil || v < 1 || v > 65535 {
-			return nil, false
+// portRange 端口段（单端口即 lo==hi）。
+type portRange struct{ lo, hi int }
+
+// parsePortRanges 解析逗号分隔的端口配置：
+//   - 单端口：22
+//   - 段：10000-20000（反向 20000-10000 等价，自动归一化）
+//   - 排除：以负号开头，如 -11111--11114（排除 11111~11114；反向写法等价）
+//
+// 返回（包含段, 排除段, 是否有效）。
+func parsePortRanges(val string) ([]portRange, []portRange, bool) {
+	var inc, exc []portRange
+	for _, item := range splitList(val) {
+		exclude := false
+		if strings.HasPrefix(item, "-") {
+			exclude = true
+			item = item[1:]
 		}
-		out = append(out, v)
+		// 规范化连续横杠：-11111--11114 去掉前缀负号后为 11111--11114 → 11111-11114
+		for strings.Contains(item, "--") {
+			item = strings.ReplaceAll(item, "--", "-")
+		}
+		var r portRange
+		if strings.Contains(item, "-") {
+			parts := strings.SplitN(item, "-", 2)
+			a, err1 := strconv.Atoi(parts[0])
+			b, err2 := strconv.Atoi(parts[1])
+			if err1 != nil || err2 != nil || a < 1 || b < 1 || a > 65535 || b > 65535 {
+				return nil, nil, false
+			}
+			r.lo, r.hi = min(a, b), max(a, b) // 反向归一化
+		} else {
+			v, err := strconv.Atoi(item)
+			if err != nil || v < 1 || v > 65535 {
+				return nil, nil, false
+			}
+			r.lo, r.hi = v, v
+		}
+		if exclude {
+			exc = append(exc, r)
+		} else {
+			inc = append(inc, r)
+		}
 	}
-	return out, true
+	return inc, exc, len(inc) > 0
+}
+
+// expandPorts 展开包含段为端口列表并剔除排除段（排除不存在的端口静默忽略）。
+func expandPorts(inc, exc []portRange) []int {
+	var out []int
+	for _, r := range inc {
+		for p := r.lo; p <= r.hi; p++ {
+			out = append(out, p)
+		}
+	}
+	if len(exc) == 0 {
+		return out
+	}
+	exSet := make(map[int]struct{})
+	for _, r := range exc {
+		for p := r.lo; p <= r.hi; p++ {
+			exSet[p] = struct{}{}
+		}
+	}
+	filtered := out[:0]
+	for _, p := range out {
+		if _, ok := exSet[p]; !ok {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
 }
 
 func parseIntIn(val string, lo, hi int) (int, bool) {
@@ -219,40 +391,4 @@ func parseIntIn(val string, lo, hi int) (int, bool) {
 
 func warnf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "potlite: 警告: "+format+"\n", args...)
-}
-
-// UpdateKeys 把多个键值写回配置文件（程序自动维护字段用）。
-// 保留原文件全部内容：已有该键则替换值，没有则追加。
-func UpdateKeys(path string, kvs map[string]string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	text := string(data)
-	lines := strings.Split(text, "\n")
-	updated := make(map[string]bool, len(kvs))
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		eq := strings.Index(trimmed, "=")
-		if eq <= 0 {
-			continue
-		}
-		k := strings.ToLower(strings.TrimSpace(trimmed[:eq]))
-		if v, ok := kvs[k]; ok {
-			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-			lines[i] = indent + k + " = " + v
-			updated[k] = true
-		}
-	}
-	var sb strings.Builder
-	sb.WriteString(strings.Join(lines, "\n"))
-	for k, v := range kvs {
-		if !updated[k] {
-			if !strings.HasSuffix(sb.String(), "\n") {
-				sb.WriteString("\n")
-			}
-			sb.WriteString("\n" + k + " = " + v + "\n")
-		}
-	}
-	return os.WriteFile(path, []byte(sb.String()), 0600)
 }
