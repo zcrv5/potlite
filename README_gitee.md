@@ -1,7 +1,5 @@
 # 轻蜜罐 PotLite
 
-**中文** | [English](README_EN.md)
-
 蜜罐端口一经访问即全 IP 永封的 Go 单二进制工具。零依赖、一键运行。
 
 ***
@@ -11,7 +9,7 @@
 ### 一键安装启动
 
 ```bash
-mkdir -p /root/potlite && curl -sSL https://github.com/zcrv5/potlite/releases/latest/download/potlite-linux-amd64 -o /root/potlite/potlite && chmod +x /root/potlite/potlite && /root/potlite/potlite install
+mkdir -p /root/potlite && curl -sSL https://gitee.com/zcrv5/potlite/releases/download/v1.2.1/potlite-linux-amd64 -o /root/potlite/potlite && chmod +x /root/potlite/potlite && /root/potlite/potlite install
 ```
 
 执行后自动完成：下载最新版到/root/potlite/、安装为系统服务、开机自启、任意目录可直接使用 `potlite` 命令。
@@ -29,7 +27,7 @@ mkdir -p /root/potlite && curl -sSL https://github.com/zcrv5/potlite/releases/la
 mkdir -p /root/potlite
 
 # 2. 下载二进制程序
-curl -sSL https://github.com/zcrv5/potlite/releases/latest/download/potlite-linux-amd64 -o /root/potlite/potlite
+curl -sSL https://gitee.com/zcrv5/potlite/releases/download/v1.2.1/potlite-linux-amd64 -o /root/potlite/potlite
 
 # 3. 赋予执行权限
 chmod +x /root/potlite/potlite
@@ -46,7 +44,7 @@ chmod +x /root/potlite/potlite
 每次发布都附带官方校验文件，可验证下载的二进制未被篡改：
 
 ```bash
-curl -sSL https://github.com/zcrv5/potlite/releases/latest/download/checksums.txt -o /tmp/checksums.txt
+curl -sSL https://gitee.com/zcrv5/potlite/releases/download/v1.2.1/checksums.txt -o /tmp/checksums.txt
 cd /root/potlite && grep potlite-linux-amd64 /tmp/checksums.txt | sha256sum -c -
 # 输出 "potlite: OK" 即校验通过
 ```
@@ -199,10 +197,10 @@ IP,被拒总数,首次拒绝时间,最新拒绝时间
 - 删除文件 → 该文件对应的封禁全部解除；
 - 文件未变化时跳过读取，无额外开销。
 
-例如下载仓库中的共享黑名单启用：
+例如下载 Gitee 上的共享黑名单启用：
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlite.bans2 -o /root/potlite.bans2
+curl -sSL https://gitee.com/zcrv5/potlite/raw/master/blacklists/potlite.bans2 -o /root/potlite.bans2
 ```
 
 1 分钟内自动生效。程序自身产物（`potlite.bans.bak`、`potlite.bans.corrupt.*`）不会被误读。
