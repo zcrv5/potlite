@@ -18,8 +18,9 @@ import (
 
 // Config 全部配置项。
 type Config struct {
-	Ports          []int    // 蜜罐监听端口
-	IntervalBans   int      // bans 落盘间隔（分钟）
+	Ports          []int     // 蜜罐监听端口
+	BanDays        float64   // 封禁时间（天）：0=永久封禁；>0 到期自动解封，支持小数（0.15=3小时36分）
+	IntervalBans   int       // bans 落盘间隔（分钟）
 	IntervalLog    int      // CSV 落盘间隔（分钟）
 	IntervalDdns   int      // DDNS 解析间隔（分钟）
 	LogLevel       int      // 日志级别 0-1
@@ -45,6 +46,7 @@ var defaultPorts = []int{22, 21, 23, 25, 110, 135, 139, 143, 445, 1433, 3306, 33
 func Default() *Config {
 	return &Config{
 		Ports:        append([]int(nil), defaultPorts...),
+		BanDays:      0,
 		IntervalBans: 1,
 		IntervalLog:  10,
 		IntervalDdns: 120,
@@ -63,12 +65,18 @@ func Default() *Config {
 // DefaultTemplate 完整配置模板（按设置块组织，含中文注释）。
 // 版本升级时程序以本模板为准重写配置文件（保留用户值）。
 const DefaultTemplate = `# PotLite 轻蜜罐配置文件
-# 修改后执行 systemctl reload potlite 热重载生效
+# 修改后执行 potlite reload 热重载生效
 
 ##########################
 # 蜜罐监听端口(逗号分隔)。支持端口段(如 100-300,500-300)与排除(如 -80 , -80--90)
 # 默认20个端口为 22,21,23,25,110,135,139,143,445,1433,3306,3389,5432,5900,6379,8080,8888,9200,11211,27017
 ports = 22,21,23,25,110,135,139,143,445,1433,3306,3389,5432,5900,6379,8080,8888,9200,11211,27017
+##########################
+
+##########################
+# 封禁时间(单位:天):0=永久封禁(默认);填写数字则到期自动解封,支持小数
+# 例:7=封禁7天;0.15=封禁3小时36分
+ban.days = 0
 ##########################
 
 ##########################
@@ -252,6 +260,12 @@ func (c *Config) apply(key, val string) {
 			}
 		} else {
 			warnf("ports 值无效，使用默认端口")
+		}
+	case "ban.days":
+		if v, ok := parseFloatIn(val, 0, 36500); ok {
+			c.BanDays = v
+		} else {
+			warnf("ban.days 值无效（需 0-36500 天），使用默认 0（永久封禁）")
 		}
 	case "interval.bans":
 		if v, ok := parseIntIn(val, 1, 1440); ok {
@@ -440,6 +454,15 @@ func expandPorts(inc, exc []portRange) []int {
 
 func parseIntIn(val string, lo, hi int) (int, bool) {
 	v, err := strconv.Atoi(val)
+	if err != nil || v < lo || v > hi {
+		return 0, false
+	}
+	return v, true
+}
+
+// parseFloatIn 解析小数配置值（ban.days 等），越界返回 false。
+func parseFloatIn(val string, lo, hi float64) (float64, bool) {
+	v, err := strconv.ParseFloat(val, 64)
 	if err != nil || v < lo || v > hi {
 		return 0, false
 	}

@@ -253,6 +253,54 @@ func (f *FW) Unban(ip netip.Addr) error {
 	return f.conn.Flush()
 }
 
+// UnbanMany 批量解封（到期解封用，避免逐条 netlink 往返卡住周期）。
+// 分批删除（单条消息长度限制同 ReplayBans）；v6 段按 /64 折叠去重。
+// 调用方注意：元素已不存在的删除会报错（逐条兜底或忽略错误）。
+func (f *FW) UnbanMany(ips []netip.Addr) error {
+	var els4 []nftables.SetElement
+	seen6 := make(map[string]struct{})
+	var els6 []nftables.SetElement
+	for _, ip := range ips {
+		if ip.Is4() {
+			els4 = append(els4, nftables.SetElement{Key: ip.AsSlice()})
+			continue
+		}
+		p := netip.PrefixFrom(ip, 64).Masked()
+		if _, dup := seen6[p.String()]; dup {
+			continue
+		}
+		seen6[p.String()] = struct{}{}
+		els6 = append(els6, prefixElems(p)...)
+	}
+	const batchElems = 250
+	del := func(set *nftables.Set, els []nftables.SetElement) error {
+		for i := 0; i < len(els); i += batchElems {
+			end := i + batchElems
+			if end > len(els) {
+				end = len(els)
+			}
+			if err := f.conn.SetDeleteElements(set, els[i:end]); err != nil {
+				return err
+			}
+			if err := f.conn.Flush(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(els4) > 0 {
+		if err := del(f.ban4, els4); err != nil {
+			return err
+		}
+	}
+	if len(els6) > 0 {
+		if err := del(f.ban6, els6); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // MovePending6 搬运：把 pending6 中的动态封禁（单地址）升级为 /64 段写入 banned6 并清除。
 // 周期任务调用（interval.bans）。
 func (f *FW) MovePending6() (int, error) {
@@ -312,30 +360,55 @@ func (f *FW) Disallow(p netip.Prefix) error {
 }
 
 // ReplayBans 启动重放：批量写入封禁名单（Setup 之后调用；v6 段进 banned6）。
+// 分批写入：SetAddElements 会把全部元素编入单条 netlink 消息，条目多时
+// 超出内核消息长度上限（sendmsg: message too long，启动即失败），
+// 故按批发送（每批独立 Flush）；v6 段先按 /64 折叠去重，避免跨批重复元素报错。
 func (f *FW) ReplayBans(bans []netip.Addr) error {
 	if len(bans) == 0 {
 		return nil
 	}
-	var els4, els6 []nftables.SetElement
+	var els4 []nftables.SetElement
+	seen6 := make(map[string]struct{})
+	var els6 []nftables.SetElement
 	for _, ip := range bans {
 		if ip.Is4() {
 			els4 = append(els4, nftables.SetElement{Key: ip.AsSlice()})
-		} else {
-			p := netip.PrefixFrom(ip, 64).Masked()
-			els6 = append(els6, prefixElems(p)...)
+			continue
 		}
+		p := netip.PrefixFrom(ip, 64).Masked()
+		if _, dup := seen6[p.String()]; dup {
+			continue
+		}
+		seen6[p.String()] = struct{}{}
+		els6 = append(els6, prefixElems(p)...)
+	}
+	const batchElems = 250 // 每批元素数（单消息 ~10KB，远低于内核上限）
+	write := func(set *nftables.Set, els []nftables.SetElement) error {
+		for i := 0; i < len(els); i += batchElems {
+			end := i + batchElems
+			if end > len(els) {
+				end = len(els)
+			}
+			if err := f.conn.SetAddElements(set, els[i:end]); err != nil {
+				return err
+			}
+			if err := f.conn.Flush(); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	if len(els4) > 0 {
-		if err := f.conn.SetAddElements(f.ban4, els4); err != nil {
+		if err := write(f.ban4, els4); err != nil {
 			return fmt.Errorf("重放 v4 封禁失败: %w", err)
 		}
 	}
 	if len(els6) > 0 {
-		if err := f.conn.SetAddElements(f.ban6, els6); err != nil {
+		if err := write(f.ban6, els6); err != nil {
 			return fmt.Errorf("重放 v6 封禁失败: %w", err)
 		}
 	}
-	return f.conn.Flush()
+	return nil
 }
 
 // ReplayWhitelist 白名单重放（Setup 之后调用，全量）。

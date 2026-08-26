@@ -93,7 +93,7 @@ cd /root/potlite && grep potlite-linux-amd64 /tmp/checksums.txt | sha256sum -c -
 | 命令                          | 说明                        |
 | --------------------------- | ------------------------- |
 | `systemctl status potlite` | 查看状态（含监听端口和封禁 IP 数量；完整详情推荐使用 `potlite info`） |
-| `systemctl reload potlite`  | 修改配置后热重载（服务不中断）           |
+| `potlite reload` | 修改配置后热重载（服务不中断）           |
 | `systemctl restart potlite` | 重启服务                      |
 | `systemctl stop potlite`    | 停止服务                      |
 
@@ -130,11 +130,12 @@ $ potlite stat 5
 
 ### 配置
 
-配置文件在程序所在目录的 `potlite.config`（默认路径为/root/potlite/potlite.config，首次运行自动生成，含中文注释）。修改后执行 `systemctl reload potlite` 生效。
+配置文件在程序所在目录的 `potlite.config`（默认路径为/root/potlite/potlite.config，首次运行自动生成，含中文注释）。修改后执行 `potlite reload` 生效。
 
 | 字段              | 默认              | 说明                                  |
 | --------------- | --------------- | ----------------------------------- |
 | `ports`         | 20 个常见端口        | 蜜罐监听端口（逗号分隔）                        |
+| `ban.days`      | 0               | 封禁时间（天）：0=永久封禁；>0 到期自动解封，支持小数（0.15=3小时36分）。自动封禁进入 potlite.bans 后参与滑动：到期时间=最后一次触发（新封禁/封禁期内再次访问/重启重载）+ban.days；黑名单组（在线黑名单/独立列表文件）不参与到期，永久封禁 |
 | `interval.bans` | 1               | 封禁名单记录间隔（分钟）                        |
 | `log.level`     | 0               | CSV日志等级 0=不记录 1=记录                  |
 | `interval.log`  | 10              | 日志记录间隔（分钟）                          |
@@ -149,7 +150,7 @@ $ potlite stat 5
 
 另有三个程序自动维护的字段（`latest.version` 最新版本、`total.rejected` 总计拒绝次数、`total.rejected.base` 计数基数），无需手动修改。
 
-FireHOL 说明：置 1 即启用，程序每天 0 点自动下载对应名单（如 `firehol.level1=1` 下载 level1 并保存为 `potlite.bans.firehol.level1`），随即自动生效；下载失败自动保留上一份，不影响其它功能。
+FireHOL 说明：置 1 即启用，程序每天 0 点自动从 FireHOL 官方源（iplists.firehol.org）下载对应名单（如 `firehol.level1=1` 下载 level1 并保存为 `potlite.bans.firehol.level1`），随即自动生效；下载失败自动保留上一份，不影响其它功能。
 
 ### 数据文件
 
@@ -199,7 +200,7 @@ IP,被拒总数,首次拒绝时间,最新拒绝时间
 例如下载 GitHub 上的共享黑名单启用：
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlite.bans10086 -o /root/potlite.bans2
+curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlite.bans2 -o /root/potlite.bans2
 ```
 
 1 分钟内自动生效。程序自身产物（`potlite.bans.bak`、`potlite.bans.corrupt.*`）不会被误读。

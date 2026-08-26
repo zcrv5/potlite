@@ -285,6 +285,11 @@ func newBanlist(dir string) *banlist.List {
 	return banlist.New(paths.BansFile(dir), bak)
 }
 
+// banDuration 封禁时间（天）→ 持续时间；0 或负值返回 0（永久封禁）。
+func banDuration(days float64) time.Duration {
+	return time.Duration(days * 24 * float64(time.Hour))
+}
+
 // compactPorts 把端口列表压缩显示（连续段折叠：22, 80, 10000-20000）。
 func compactPorts(ports []int) string {
 	if len(ports) == 0 {
@@ -362,6 +367,9 @@ func serve() {
 	if err := bl.Load(); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 警告:", err)
 	}
+	// 重启/重新导入：所有自动封禁按 ban.days 重新计时（滑动窗口从此刻起算）；
+	// 明确永久条目（#整合 导入等）与黑名单组不受影响
+	bl.ResetExpires(cfg.BanDays)
 	must(fw.ReplayBans(bl.Snapshot()))
 	// FireHOL 在线黑名单：先下载再扫描（保证启动即收录）
 	syncFirehol(cfg, dir)
@@ -396,7 +404,12 @@ func serve() {
 		if err := fw.Ban(ip); err != nil {
 			return err
 		}
-		bl.Add(ip)
+		// 封禁时间（ban.days）：0=永久；>0 记到期时间，由周期任务自动解封
+		if d := curCfg.Load().BanDays; d > 0 {
+			bl.AddExpire(ip, time.Now().Add(banDuration(d)))
+		} else {
+			bl.Add(ip)
+		}
 		return nil
 	}
 	var hp *honeypot.Server
@@ -417,6 +430,8 @@ func serve() {
 
 	// 周期任务：同步内核动态封禁（dynset 产生）→ bans 合并落盘 + pending6 搬运
 	// 间隔动态读取（SIGHUP 改 interval.bans 后下一轮生效）
+	// 滑动窗口：被封 IP 内核元素计数快照（检测"封禁期内再次访问"→ 重置封禁时间）
+	banSeen := make(map[string]uint64)
 	go func() {
 		for {
 			time.Sleep(time.Duration(curCfg.Load().IntervalBans) * time.Minute)
@@ -434,6 +449,9 @@ func serve() {
 					_ = fw.UnbanPrefix(p)
 				}
 			}
+			// 1.5) 并入文件状态（CLI 进程 ban/unban 写入的最新到期/永久记录），
+			//      保证到期判定（2.5）用最新 expires，避免 CLI 重封的新到期被旧值提前解封
+			bl.SyncFile()
 			// 2) 内核动态封禁（dynset 产生）同步进主名单——组 IP 除外（组由文件管理，不进主文件）
 			if ips, err := fw.ListBanned4(); err == nil {
 				for _, a := range ips {
@@ -446,6 +464,52 @@ func serve() {
 				for _, a := range ips {
 					if !bl.InGroup(a) {
 						bl.Add(a)
+					}
+				}
+			}
+			// 2.4) 滑动窗口：被封 IP 封禁期内再次访问（内核集合元素计数增长）→ 封禁时间重置。
+			//      "再次访问"判定：被封后新 SYN 命中封禁集合即计数（全端口命中计数）。
+			//      v4 键 = IP；v6 键 = /64 段（与 ListBannedCounters 格式一致）。
+			if d := curCfg.Load().BanDays; d > 0 {
+				counters := fw.ListBannedCounters()
+				now := time.Now()
+				for _, a := range bl.ActiveExpires() {
+					key := a.String()
+					if a.Is6() {
+						key = netip.PrefixFrom(a, 64).Masked().String()
+					}
+					cur := counters[key]
+					if last, ok := banSeen[key]; ok && cur > last {
+						bl.AddExpire(a, now.Add(banDuration(d)))
+						fmt.Printf("potlite: %s 封禁期内再次访问，封禁时间已重置\n", a)
+					}
+					banSeen[key] = cur
+				}
+			}
+			// 2.5) 到期解封（ban.days>0 的封禁到期后自动解封）：
+			//      批量解内核（避免逐条 netlink 往返）+ 一次性批量落盘（避免逐条原子写）
+			if expired := bl.Expired(time.Now()); len(expired) > 0 {
+				if err := fw.UnbanMany(expired); err != nil {
+					// 批量失败（可能个别元素已不存在）→ 逐条兜底
+					fmt.Fprintf(os.Stderr, "potlite: 批量到期解封失败，逐条兜底: %v\n", err)
+					for _, a := range expired {
+						_ = fw.Unban(a) // 已删除元素的报错忽略
+					}
+				}
+				for _, a := range expired {
+					bl.Remove(a)
+					fmt.Printf("potlite: %s 封禁到期已自动解封\n", a)
+				}
+				if err := bl.SaveRemoveMany(expired); err != nil {
+					// 落盘失败：回滚内存（下轮重试），避免文件残留导致重启后复活
+					fmt.Fprintf(os.Stderr, "potlite: %d 条到期解封落盘失败: %v\n", len(expired), err)
+					d := curCfg.Load().BanDays
+					for _, a := range expired {
+						if d > 0 {
+							bl.AddExpire(a, time.Now().Add(banDuration(d)))
+						} else {
+							bl.Add(a)
+						}
 					}
 				}
 			}
@@ -809,7 +873,12 @@ func manage(cmd, arg string) {
 	case "ban":
 		ip := mustIP(arg)
 		must(fw.Ban(ip))
-		bl.Add(ip)
+		// 封禁时间（ban.days）：0=永久；>0 记到期时间，由周期任务自动解封
+		if d := cfg.BanDays; d > 0 {
+			bl.AddExpire(ip, time.Now().Add(banDuration(d)))
+		} else {
+			bl.Add(ip)
+		}
 		must(bl.SaveMerge())
 		fmt.Printf("已封禁 %s\n", ip)
 	case "unban":
@@ -1139,7 +1208,7 @@ func checkLatest(cfgPath string) {
 
 // ---------- FireHOL 在线黑名单 ----------
 
-const fireholBase = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/"
+const fireholBase = "https://iplists.firehol.org/files/"
 
 // fireholSources 配置开关 → 远端文件 → 本地文件名（黑名单组机制自动收录）。
 var fireholSources = []struct {

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,8 +25,10 @@ type List struct {
 	mu      sync.Mutex
 	path    string
 	bakPath string // 备份文件路径（程序所在目录；空则禁用回滚）
-	ips     map[netip.Addr]struct{} // 主名单（落盘 potlite.bans）
-	groups  map[string]*group       // 外部黑名单组（文件是真相源，不落盘主文件）
+	ips     map[netip.Addr]struct{}  // 主名单（落盘 potlite.bans）
+	expires map[netip.Addr]time.Time // 封禁到期时间（零值 = 无到期/永久；到期由周期任务解封）
+	dirty   map[netip.Addr]struct{}  // 本轮新增/变更（SaveMerge 写回依据：文件已删的条目不复活）
+	groups  map[string]*group        // 外部黑名单组（文件是真相源，不落盘主文件）
 }
 
 // group 一个黑名单组的当前状态（mtime+size 用于变化侦测，未变化跳过读取）。
@@ -38,7 +41,7 @@ type group struct {
 
 // New 创建名单（不加载）。bakPath 为备份文件路径（放程序所在目录，可自动回滚）。
 func New(path, bakPath string) *List {
-	return &List{path: path, bakPath: bakPath, ips: make(map[netip.Addr]struct{}), groups: make(map[string]*group)}
+	return &List{path: path, bakPath: bakPath, ips: make(map[netip.Addr]struct{}), expires: make(map[netip.Addr]time.Time), dirty: make(map[netip.Addr]struct{}), groups: make(map[string]*group)}
 }
 
 // Load 从文件加载名单到内存。文件不存在则空名单；读取失败按 corrupt 保护处理。
@@ -61,11 +64,11 @@ func (l *List) Load() error {
 		if line == "" {
 			continue
 		}
-		if a, err := netip.ParseAddr(line); err == nil {
+		if a, exp, ok := parseEntry(line); ok {
 			l.ips[a] = struct{}{}
-		} else if p, err := netip.ParsePrefix(line); err == nil {
-			// 段（v6 /64）以段内第一个地址记录；v4 段同样以起始地址记录
-			l.ips[p.Addr()] = struct{}{}
+			if !exp.IsZero() {
+				l.expires[a] = exp
+			}
 		}
 		// 无法解析的行静默跳过
 	}
@@ -79,6 +82,7 @@ func (l *List) Load() error {
 			if data, err := os.ReadFile(l.bakPath); err == nil {
 				if err := os.WriteFile(l.path, data, 0600); err == nil {
 					l.ips = make(map[netip.Addr]struct{})
+					l.expires = make(map[netip.Addr]time.Time)
 					if f2, err := os.Open(l.path); err == nil {
 						sc2 := bufio.NewScanner(f2)
 						sc2.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -87,10 +91,11 @@ func (l *List) Load() error {
 							if line == "" {
 								continue
 							}
-							if a, err := netip.ParseAddr(line); err == nil {
+							if a, exp, ok := parseEntry(line); ok {
 								l.ips[a] = struct{}{}
-							} else if p, err := netip.ParsePrefix(line); err == nil {
-								l.ips[p.Addr()] = struct{}{}
+								if !exp.IsZero() {
+									l.expires[a] = exp
+								}
 							}
 						}
 						f2.Close()
@@ -100,6 +105,36 @@ func (l *List) Load() error {
 		}
 	}
 	return nil
+}
+
+// parseEntry 解析名单行：
+//   - "IP"：自动封禁（无明确到期，重启时按 ban.days 重新计时）
+//   - "IP 到期unix秒"：明确到期时间（到期自动解封）
+// 旧版 "IP 0"（曾经的永久标记）按自动封禁处理。段（v6 /64）以段内第一个地址记录。
+func parseEntry(line string) (netip.Addr, time.Time, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return netip.Addr{}, time.Time{}, false
+	}
+	var exp time.Time
+	if sp := strings.IndexByte(line, ' '); sp > 0 {
+		if ts, err := strconv.ParseInt(line[sp+1:], 10, 64); err == nil {
+			line = line[:sp]
+			if ts > 0 {
+				exp = time.Unix(ts, 0)
+			}
+			// ts<=0（含旧版 "IP 0"）→ 无到期（自动封禁）
+		} else {
+			return netip.Addr{}, time.Time{}, false // 带无法识别的后缀 → 无效行
+		}
+	}
+	if a, err := netip.ParseAddr(line); err == nil {
+		return a, exp, true
+	}
+	if p, err := netip.ParsePrefix(line); err == nil {
+		return p.Addr(), exp, true
+	}
+	return netip.Addr{}, time.Time{}, false
 }
 
 // countEntries 解析名单文件返回条目数（无法解析的行静默跳过）。
@@ -117,16 +152,14 @@ func countEntries(path string) (int, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if _, err := netip.ParseAddr(line); err == nil {
-			n++
-		} else if _, err := netip.ParsePrefix(line); err == nil {
+		if _, _, ok := parseEntry(line); ok {
 			n++
 		}
 	}
 	return n, sc.Err()
 }
 
-// Add 内存加入。返回是否新增（false = 已存在）。
+// Add 内存加入（永久封禁）。返回是否新增（false = 已存在）。
 func (l *List) Add(ip netip.Addr) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -134,7 +167,37 @@ func (l *List) Add(ip netip.Addr) bool {
 		return false
 	}
 	l.ips[ip] = struct{}{}
+	delete(l.expires, ip) // 永久语义，清除可能的到期记录
+	l.dirty[ip] = struct{}{}
 	return true
+}
+
+// AddExpire 内存加入并设置到期时间（到期后由周期任务解封）。
+// at 为零值等价永久封禁（清除到期记录）。
+func (l *List) AddExpire(ip netip.Addr, at time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.ips[ip] = struct{}{}
+	if at.IsZero() {
+		delete(l.expires, ip)
+	} else {
+		l.expires[ip] = at
+	}
+	l.dirty[ip] = struct{}{}
+}
+
+// Expired 返回已到期（now 之后不再有效）的封禁地址列表（排序）。
+func (l *List) Expired(now time.Time) []netip.Addr {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []netip.Addr
+	for a, exp := range l.expires {
+		if !exp.IsZero() && now.After(exp) {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Less(out[j]) })
+	return out
 }
 
 // Remove 内存移除。
@@ -142,6 +205,52 @@ func (l *List) Remove(ip netip.Addr) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.ips, ip)
+	delete(l.expires, ip)
+	delete(l.dirty, ip)
+}
+
+// ResetExpires 重启/重新导入时重置所有自动封禁的到期时间（滑动窗口重新计时）；
+// days<=0 时全部恢复永久，并同步文件清除残留的旧到期行
+// （否则下轮 SaveMerge 读文件并入会把到期恢复，永久化永远写不回文件）。
+func (l *List) ResetExpires(days float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	needSync := false
+	for a := range l.ips {
+		if days > 0 {
+			l.expires[a] = now.Add(time.Duration(days * 24 * float64(time.Hour)))
+			l.dirty[a] = struct{}{}
+		} else {
+			delete(l.expires, a)
+			needSync = true
+		}
+	}
+	if needSync {
+		merged := make(map[netip.Addr]time.Time, len(l.ips))
+		for a := range l.ips {
+			if exp, ok := l.expires[a]; ok {
+				merged[a] = exp
+			} else {
+				merged[a] = time.Time{}
+			}
+		}
+		_ = l.atomicWrite(merged)
+	}
+}
+
+// ActiveExpires 返回所有带到期时间的条目（滑动窗口"再次访问重置"检测用，排序）。
+func (l *List) ActiveExpires() []netip.Addr {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []netip.Addr
+	for a, exp := range l.expires {
+		if !exp.IsZero() {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Less(out[j]) })
+	return out
 }
 
 // Has 是否存在。
@@ -281,10 +390,13 @@ func (l *List) ScanMerge(dir string) (needBan, needUnban []netip.Prefix, err err
 			continue // 读失败容忍（如文件正在被写入）
 		}
 		if integrate {
-			// 一次性整合进主名单（由周期落盘写入 potlite.bans），完成后删除源文件
+			// 一次性整合进主名单（由周期落盘写入 potlite.bans），完成后删除源文件。
+			// 整合后即普通自动条目：参与到期滑动（重启重置/再次访问重置/到期解封）。
 			for p := range cur {
 				if _, dup := l.ips[p.Addr()]; !dup {
 					l.ips[p.Addr()] = struct{}{}
+					delete(l.expires, p.Addr())
+					l.dirty[p.Addr()] = struct{}{}
 					needBan = append(needBan, p)
 				}
 			}
@@ -321,50 +433,102 @@ func (l *List) ScanMerge(dir string) (needBan, needUnban []netip.Prefix, err err
 	return needBan, needUnban, nil
 }
 
+// SyncFile 把文件中的到期记录并入内存（CLI 进程 potlite ban/unban 写入的最新状态）。
+// 单向往内存合并（不删除、不写回）；到期时间取"更晚"（内存已有更新值如滑动重置时不覆盖）；
+// 必须在到期判定（Expired）之前调用，否则 CLI 重新封禁的新到期在并入前会被内存旧值提前解封。
+func (l *List) SyncFile() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	f, err := os.Open(l.path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if a, exp, ok := parseEntry(line); ok {
+			if !exp.IsZero() {
+				l.ips[a] = struct{}{}
+				if cur, ok := l.expires[a]; !ok || exp.After(cur) {
+					l.expires[a] = exp
+				}
+			}
+		}
+	}
+}
+
 // SaveMerge 增量合并落盘：文件 ∪ 内存，去重后原子写回。
+// 行格式："IP"（自动）/ "IP 到期unix秒"。
+// 文件中的到期记录（CLI 进程 potlite ban 等写入）并入内存，保证服务进程感知。
+// 合并仅写回"本轮新增/变更（dirty）或文件已有"的条目——CLI unban 显式删除的条目不复活。
 func (l *List) SaveMerge() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	merged := make(map[netip.Addr]struct{}, len(l.ips)+64)
+	merged := make(map[netip.Addr]time.Time, len(l.ips)+64)
+	fileSeen := make(map[netip.Addr]struct{}, len(l.ips)+64)
 	// 先读文件
 	if f, err := os.Open(l.path); err == nil {
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 64*1024), 1024*1024)
 		for sc.Scan() {
 			line := sc.Text()
-			if a, err := netip.ParseAddr(line); err == nil {
-				merged[a] = struct{}{}
-			} else if p, err := netip.ParsePrefix(line); err == nil {
-				merged[p.Addr()] = struct{}{}
+			if a, exp, ok := parseEntry(line); ok {
+				fileSeen[a] = struct{}{}
+				merged[a] = exp
+				if !exp.IsZero() {
+					// 并入内存（CLI 写入的到期条目服务进程才能自动解封）；
+					// 取更晚到期：内存已有更新值（如滑动重置）时不被文件旧值覆盖
+					if _, inMem := l.ips[a]; !inMem {
+						l.ips[a] = struct{}{}
+					}
+					if cur, ok := l.expires[a]; !ok || exp.After(cur) {
+						l.expires[a] = exp
+					}
+				}
 			}
 		}
 		f.Close()
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("读取名单文件失败: %w", err)
 	}
-	// 合并内存
+	// 合并内存：仅写回"本轮新增/变更（dirty）或文件已有"的条目
 	for a := range l.ips {
-		merged[a] = struct{}{}
+		_, dirty := l.dirty[a]
+		_, inFile := fileSeen[a]
+		if exp, ok := l.expires[a]; ok {
+			if dirty || inFile {
+				merged[a] = exp
+			}
+			continue
+		}
+		if dirty || inFile {
+			merged[a] = time.Time{}
+		}
 	}
-	return l.atomicWrite(merged)
+	if err := l.atomicWrite(merged); err != nil {
+		return err
+	}
+	// 写回成功：清除脏标记（下轮起以文件状态为准）
+	l.dirty = make(map[netip.Addr]struct{})
+	return nil
 }
 
-// SaveRemove 落盘前先过滤掉指定 IP（Unban 防复活）。
+// SaveRemove 落盘前先过滤掉指定 IP（Unban 防复活），其余行（含到期）原样保留。
 func (l *List) SaveRemove(ip netip.Addr) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	keep := make(map[netip.Addr]struct{}, len(l.ips)+64)
+	keep := make(map[netip.Addr]time.Time, len(l.ips)+64)
 	if f, err := os.Open(l.path); err == nil {
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 64*1024), 1024*1024)
 		for sc.Scan() {
 			line := sc.Text()
-			if a, err := netip.ParseAddr(line); err == nil {
-				keep[a] = struct{}{}
-			} else if p, err := netip.ParsePrefix(line); err == nil {
-				keep[p.Addr()] = struct{}{}
+			if a, exp, ok := parseEntry(line); ok {
+				keep[a] = exp
 			}
 		}
 		f.Close()
@@ -375,20 +539,47 @@ func (l *List) SaveRemove(ip netip.Addr) error {
 	return l.atomicWrite(keep)
 }
 
-// atomicWrite 原子写回：轮换 .bak → 写临时文件 → rename。
-func (l *List) atomicWrite(ips map[netip.Addr]struct{}) error {
+// SaveRemoveMany 落盘前一次性过滤掉多个 IP（批量解封用，避免逐条全文件原子写卡死）。
+func (l *List) SaveRemoveMany(ips []netip.Addr) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	drop := make(map[netip.Addr]struct{}, len(ips))
+	for _, a := range ips {
+		drop[a] = struct{}{}
+	}
+	keep := make(map[netip.Addr]time.Time, len(l.ips)+64)
+	if f, err := os.Open(l.path); err == nil {
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			if a, exp, ok := parseEntry(line); ok {
+				if _, d := drop[a]; !d {
+					keep[a] = exp
+				}
+			}
+		}
+		f.Close()
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("读取名单文件失败: %w", err)
+	}
+	return l.atomicWrite(keep)
+}
+
+// atomicWrite 原子写回：写临时文件 → rename；成功后同步 .bak = 新文件
+// （避免"解封后文件合法变小"被回滚保护误判为损坏而回滚出已解封的 IP）。
+func (l *List) atomicWrite(ips map[netip.Addr]time.Time) error {
 	lines := make([]string, 0, len(ips))
-	for a := range ips {
-		lines = append(lines, a.String())
+	for a, exp := range ips {
+		if exp.IsZero() {
+			lines = append(lines, a.String())
+		} else {
+			lines = append(lines, fmt.Sprintf("%s %d", a, exp.Unix()))
+		}
 	}
 	sort.Strings(lines)
 
-	// 轮换 .bak（备份放程序所在目录）
-	if l.bakPath != "" {
-		if _, err := os.Stat(l.path); err == nil {
-			_ = os.Rename(l.path, l.bakPath)
-		}
-	}
 	tmp := l.path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
@@ -408,6 +599,12 @@ func (l *List) atomicWrite(ips map[netip.Addr]struct{}) error {
 	if err := os.Rename(tmp, l.path); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("替换名单文件失败: %w", err)
+	}
+	// 写成功后同步 .bak（备份放程序所在目录）
+	if l.bakPath != "" {
+		if data, err := os.ReadFile(l.path); err == nil {
+			_ = os.WriteFile(l.bakPath, data, 0600)
+		}
 	}
 	return nil
 }
