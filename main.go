@@ -373,12 +373,12 @@ func serve() {
 	must(fw.ReplayBans(bl.Snapshot()))
 	// FireHOL 在线黑名单：先下载再扫描（保证启动即收录）
 	syncFirehol(cfg, dir)
-	// 外部黑名单：一次性整合（#整合 文件）/ 黑名单组加载 → 内核同步
+	// 外部黑名单：一次性整合（#整合 文件）/ 黑名单组加载 → 内核同步（批量写入）
 	if needBan, _, err := bl.ScanMerge(dir); err != nil {
 		fmt.Fprintln(os.Stderr, "potlite: 外部名单扫描失败:", err)
 	} else {
-		for _, p := range needBan {
-			_ = fw.BanPrefix(p)
+		if err := fw.BanPrefixMany(needBan); err != nil {
+			fmt.Fprintf(os.Stderr, "potlite: 外部名单内核写入失败: %v\n", err)
 		}
 		if len(needBan) > 0 {
 			fmt.Printf("potlite: 外部名单已加载 %d 个条目\n", len(needBan))
@@ -435,18 +435,28 @@ func serve() {
 	go func() {
 		for {
 			time.Sleep(time.Duration(curCfg.Load().IntervalBans) * time.Minute)
-			// 1) 外部黑名单：一次性整合（#整合 文件并入主名单）/ 黑名单组 diff 同步 → 内核封禁与解封。
+			// 1) 外部黑名单：一次性整合（#整合 文件并入主名单）/ 黑名单组 diff 同步 → 内核封禁与解封（批量）。
 			//    放在内核同步之前，保证 groups 状态最新（组 IP 过滤与 HasMain 保护用）。
 			needBan, needUnban, err := bl.ScanMerge(dir)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "potlite: 外部名单扫描失败:", err)
 			}
-			for _, p := range needBan {
-				_ = fw.BanPrefix(p)
+			if len(needBan) > 0 {
+				if err := fw.BanPrefixMany(needBan); err != nil {
+					fmt.Fprintf(os.Stderr, "potlite: 外部名单内核写入失败: %v\n", err)
+				}
 			}
-			for _, p := range needUnban {
-				if !bl.HasMain(p.Addr()) {
-					_ = fw.UnbanPrefix(p)
+			if len(needUnban) > 0 {
+				var unbanPfx []netip.Prefix
+				for _, p := range needUnban {
+					if !bl.HasMain(p.Addr()) {
+						unbanPfx = append(unbanPfx, p)
+					}
+				}
+				if len(unbanPfx) > 0 {
+					if err := fw.UnbanPrefixMany(unbanPfx); err != nil {
+						fmt.Fprintf(os.Stderr, "potlite: 外部名单内核解除失败: %v\n", err)
+					}
 				}
 			}
 			// 1.5) 并入文件状态（CLI 进程 ban/unban 写入的最新到期/永久记录），

@@ -12,6 +12,7 @@ package nftfw
 import (
 	"fmt"
 	"net/netip"
+	"sort"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
@@ -222,6 +223,161 @@ func (f *FW) UnbanPrefix(p netip.Prefix) error {
 		return err
 	}
 	return f.conn.Flush()
+}
+
+// BanPrefixMany 批量封禁前缀段（外部黑名单组 diff 用，避免逐条 netlink 往返）：
+// v4 段进 banned4nets，v6 段进 banned6。
+// 关键处理：① 按段去重（名单间相同段）；② 排序后做区间合并——重叠/相邻区间合并为
+// 最大区间（interval 集合为半开区间 [start,end) 语义，任意区间用双端点编码写入，
+// 合并后覆盖完整、无重叠、段数最少，不会因 EEXIST 毁批）；③ 分批写入。
+func (f *FW) BanPrefixMany(prefixes []netip.Prefix) error {
+	var v4pfx, v6pfx []netip.Prefix
+	seen := make(map[string]struct{}, len(prefixes))
+	for _, p := range prefixes {
+		p = p.Masked()
+		if _, dup := seen[p.String()]; dup {
+			continue
+		}
+		seen[p.String()] = struct{}{}
+		if p.Addr().Is4() {
+			v4pfx = append(v4pfx, p)
+		} else {
+			v6pfx = append(v6pfx, p)
+		}
+	}
+	// 排序 + 区间合并：返回合并后的 [start, end) 区间对（半开区间终点 = 最后地址+1）
+	type span struct{ start, end netip.Addr }
+	merge := func(pfx []netip.Prefix) []span {
+		sort.Slice(pfx, func(i, j int) bool { return pfx[i].Addr().Less(pfx[j].Addr()) })
+		var out []span
+		var curStart, curEnd netip.Addr
+		for _, p := range pfx {
+			start := p.Addr()
+			end := prefixLast(p).Next()
+			if !end.IsValid() {
+				end = prefixLast(p)
+			}
+			if !curEnd.IsValid() {
+				curStart, curEnd = start, end
+				continue
+			}
+			if start.Less(curEnd) || start == curEnd {
+				// 重叠或相邻 → 合并（终点取更大）
+				if curEnd.Less(end) {
+					curEnd = end
+				}
+				continue
+			}
+			out = append(out, span{curStart, curEnd})
+			curStart, curEnd = start, end
+		}
+		if curEnd.IsValid() {
+			out = append(out, span{curStart, curEnd})
+		}
+		return out
+	}
+	// 区间 → interval 集合双端点元素
+	spanElems := func(s span) []nftables.SetElement {
+		return []nftables.SetElement{
+			{Key: append([]byte(nil), s.start.AsSlice()...)},
+			{Key: append([]byte(nil), s.end.AsSlice()...), IntervalEnd: true},
+		}
+	}
+	var els4, els6 []nftables.SetElement
+	for _, s := range merge(v4pfx) {
+		els4 = append(els4, spanElems(s)...)
+	}
+	for _, s := range merge(v6pfx) {
+		els6 = append(els6, spanElems(s)...)
+	}
+	const batchElems = 250
+	write := func(set *nftables.Set, els []nftables.SetElement) error {
+		for i := 0; i < len(els); i += batchElems {
+			end := i + batchElems
+			if end > len(els) {
+				end = len(els)
+			}
+			if err := f.conn.SetAddElements(set, els[i:end]); err != nil {
+				// 兜底：批量意外失败时逐条写入，重复/冲突元素静默丢弃
+				for _, el := range els[i:end] {
+					_ = f.conn.SetAddElements(set, []nftables.SetElement{el})
+					_ = f.conn.Flush()
+				}
+				continue
+			}
+			if err := f.conn.Flush(); err != nil {
+				for _, el := range els[i:end] {
+					_ = f.conn.SetAddElements(set, []nftables.SetElement{el})
+					_ = f.conn.Flush()
+				}
+			}
+		}
+		return nil
+	}
+	if len(els4) > 0 {
+		if err := write(f.ban4Nets, els4); err != nil {
+			return err
+		}
+	}
+	if len(els6) > 0 {
+		if err := write(f.ban6, els6); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UnbanPrefixMany 批量解除前缀段封禁（外部黑名单组 diff 用）。按段去重；
+// 失败批退化为逐条删除（不存在的元素静默忽略）。
+func (f *FW) UnbanPrefixMany(prefixes []netip.Prefix) error {
+	var els4, els6 []nftables.SetElement
+	seen := make(map[string]struct{}, len(prefixes))
+	for _, p := range prefixes {
+		p = p.Masked()
+		if _, dup := seen[p.String()]; dup {
+			continue
+		}
+		seen[p.String()] = struct{}{}
+		if p.Addr().Is4() {
+			els4 = append(els4, prefixElems(p)...)
+		} else {
+			els6 = append(els6, prefixElems(p)...)
+		}
+	}
+	const batchElems = 250
+	del := func(set *nftables.Set, els []nftables.SetElement) error {
+		for i := 0; i < len(els); i += batchElems {
+			end := i + batchElems
+			if end > len(els) {
+				end = len(els)
+			}
+			if err := f.conn.SetDeleteElements(set, els[i:end]); err != nil {
+				for _, el := range els[i:end] {
+					_ = f.conn.SetDeleteElements(set, []nftables.SetElement{el})
+					_ = f.conn.Flush()
+				}
+				continue
+			}
+			if err := f.conn.Flush(); err != nil {
+				for _, el := range els[i:end] {
+					_ = f.conn.SetDeleteElements(set, []nftables.SetElement{el})
+					_ = f.conn.Flush()
+				}
+			}
+		}
+		return nil
+	}
+	if len(els4) > 0 {
+		if err := del(f.ban4Nets, els4); err != nil {
+			return err
+		}
+	}
+	if len(els6) > 0 {
+		if err := del(f.ban6, els6); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (f *FW) Ban(ip netip.Addr) error {
