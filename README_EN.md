@@ -164,8 +164,8 @@ Takes effect within 1 minute. Program artifacts (`potlite.bans.bak`, `potlite.ba
 
 ## Features
 
-- **Ban on contact**: any IP touching any honeypot port gets ALL its traffic kernel-blocked (blocked at SYN stage; nmap/masscan half-open scans cannot bypass);
-- **All-port, all-protocol ban**: TCP/UDP/ICMP traffic from the banned IP is rejected;
+- **Ban on contact**: any IP touching any honeypot port gets ALL its traffic silently dropped (blackhole: no RST, no ICMP error, nothing is ever sent back; blocked at SYN stage; nmap/masscan half-open scans cannot bypass);
+- **All-port, all-protocol blackhole**: TCP/UDP/ICMP traffic from the banned IP is silently dropped — the server responds to nothing from that IP;
 - **IPv6 banned by /64**: the whole subnet is banned, not a single address;
 - **Multi-source whitelist**: built-in 127.0.0.1 + local interface IPs + static config + DDNS domains;
 - **Persistence**: ban list saved incrementally, auto-restored after reboot (`potlite.bans` only grows, never overwritten);

@@ -1,7 +1,7 @@
 // Package nflog 订阅内核 NFLOG 组播（蜜罐被拒包的旁路通知）并解析包头。
 // 自研实现：组播接收（JoinGroup）+ 配置消息（设置 NFLOG 实例 copy mode = COPY_PACKET，否则内核默认只发元数据无包内容）。
 //
-// 规则链保证（设计文档 7 章）：log group 1（snaplen 128）挂在"新 IP 首条 SYN"与"全端口 reject"规则上，
+// 规则链保证（设计文档 7 章）：log group 1（snaplen 128）挂在"新 IP 首条 SYN"与"全端口 drop"规则上，
 // 程序按级别决定如何使用事件：级别 1/2 只取新 IP 的首条（触发端口），级别 3 全量聚合端口明细。
 package nflog
 

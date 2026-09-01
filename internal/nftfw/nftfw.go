@@ -1,7 +1,7 @@
 // Package nftfw 封装 nftables 操作：表/集合/规则链的创建与元素维护。
 //
 // 表结构：inet potlite（与 fail2ban 的 f2b-table、云镜 ip filter 完全隔离）。
-// 规则链顺序（蜜罐端口流量）：白名单 accept → 已封静默 drop → 新 SYN dynset 封禁 → 全端口 reject。
+// 规则链顺序（蜜罐端口流量）：白名单 accept → 已封静默 drop → 新 SYN dynset 封禁 → 全端口静默 drop（黑洞）。
 //
 // 实测确立的内核限制（7.1.5，设计依据）：
 //   - dynset（规则内动态添加）**不支持 interval 集合**（EOPNOTSUPP），支持 counter 集合；
@@ -25,8 +25,8 @@ const (
 	setPorts  = "ports"
 	setWl4    = "whitelist4"
 	setWl6    = "whitelist6"
-	setBan4   = "banned4"  // counter，无 interval：dynset v4 目标 + 全端口 reject
-	setBan4Nets = "banned4nets" // interval + counter：v4 段封禁（FireHOL 等 CIDR 名单），全端口 reject
+	setBan4   = "banned4"  // counter，无 interval：dynset v4 目标 + 全端口静默 drop
+	setBan4Nets = "banned4nets" // interval + counter：v4 段封禁（FireHOL 等 CIDR 名单），全端口静默 drop
 	setObPorts = "ob_ports"     // inet_service：出站自动白名单放行的新连接端口（空 = 全端口模式）
 	setObOk    = "ob_ok"        // ipv4：出站自动白名单（端口限定模式）
 	setObOk6   = "ob_ok6"       // ipv6：同上
@@ -186,10 +186,10 @@ func (f *FW) Setup(ports []int) error {
 	f.addRule(f.ruleBannedDrop(true, setBan6))
 	f.addRule(f.ruleDynsetBan(false, setBan4))
 	f.addRule(f.ruleDynsetBan(true, setPend6))
-	f.addRule(f.ruleAllReject(false, setBan4))
-	f.addRule(f.ruleAllReject(false, setBan4Nets))
-	f.addRule(f.ruleAllReject(true, setPend6))
-	f.addRule(f.ruleAllReject(true, setBan6))
+	f.addRule(f.ruleAllDrop(false, setBan4))
+	f.addRule(f.ruleAllDrop(false, setBan4Nets))
+	f.addRule(f.ruleAllDrop(true, setPend6))
+	f.addRule(f.ruleAllDrop(true, setBan6))
 	return f.conn.Flush()
 }
 
@@ -925,13 +925,13 @@ func (f *FW) ruleDynsetBan(isV6 bool, setName string) *nftables.Rule {
 	return &nftables.Rule{Table: f.table, Chain: f.chain, Exprs: exprs}
 }
 
-// 规则 8-10：被封 IP 的其余全部流量拒绝（全端口全协议）。
-func (f *FW) ruleAllReject(isV6 bool, setName string) *nftables.Rule {
+// 规则 8-10：被封 IP 的其余全部流量静默丢弃（全端口全协议，黑洞式无响应）。
+// 对外表现：封禁 IP 的任何连接/探测（TCP/UDP/ICMP）均无任何回应。
+func (f *FW) ruleAllDrop(isV6 bool, setName string) *nftables.Rule {
 	exprs := matchSaddr(isV6)
 	exprs = append(exprs,
 		&expr.Lookup{SourceRegister: 1, SetName: setName},
-		// reject with icmp/icmpv6 port-unreachable（Type 2=ICMPX, Code 1=port unreachable）
-		&expr.Reject{Type: 2, Code: 1},
+		&expr.Verdict{Kind: expr.VerdictDrop},
 	)
 	return &nftables.Rule{Table: f.table, Chain: f.chain, Exprs: exprs}
 }

@@ -211,8 +211,8 @@ curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlit
 
 ## 特性
 
-- **连接即永封**：任何 IP 触碰任一蜜罐端口，该 IP 的全部访问被内核防火墙永久拒绝（SYN 阶段即封，nmap/masscan 半开扫描无法绕过）；
-- **全端口全协议封禁**：触发后该 IP 对服务器的 TCP/UDP/ICMP 一切流量均被拒绝；
+- **连接即永封**：任何 IP 触碰任一蜜罐端口，该 IP 的全部访问被内核防火墙静默丢弃（黑洞式无响应，SYN 阶段即封，nmap/masscan 半开扫描无法绕过）；
+- **全端口全协议黑洞**：触发后该 IP 对服务器的 TCP/UDP/ICMP 一切流量均被静默丢弃——不回应、无 RST、无 ICMP 错误，对方探测不到任何信息；
 - **IPv6 按 /64 段封禁**：封禁整个网段而非单地址；
 - **白名单多来源**：内置 127.0.0.1 + 本机接口 IP 自动放行 + 静态配置 + DDNS 域名；
 - **持久化**：封禁名单增量落盘、服务器重启自动恢复（`potlite.bans` 只增不减、永不覆盖丢失）；
@@ -226,7 +226,7 @@ curl -sSL https://raw.githubusercontent.com/zcrv5/potlite/main/blacklists/potlit
 
 **我误连蜜罐端口被封了怎么办？**
 
-封禁是整个 IP 全端口拒绝（包括 SSH）。通过云厂商 VNC/OrcaTerm 控制台登录后执行 `potlite unban <你的IP>`。若你的出口 IP 解析自 DDNS 域名，下一轮解析会把你加入白名单（白名单在规则链最前放行，访问即恢复）。
+封禁是整个 IP 全端口静默丢弃（包括 SSH，对方连接无任何回应）。通过云厂商 VNC/OrcaTerm 控制台登录后执行 `potlite unban <你的IP>`。若你的出口 IP 解析自 DDNS 域名，下一轮解析会把你加入白名单（白名单在规则链最前放行，访问即恢复）。
 
 **怎么看谁被封了？**
 
