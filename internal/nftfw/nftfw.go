@@ -20,39 +20,39 @@ import (
 )
 
 const (
-	tableName = "potlite"
-	chainName = "input"
-	setPorts  = "ports"
-	setWl4    = "whitelist4"
-	setWl6    = "whitelist6"
-	setBan4   = "banned4"  // counter，无 interval：dynset v4 目标 + 全端口静默 drop
+	tableName   = "potlite"
+	chainName   = "input"
+	setPorts    = "ports"
+	setWl4      = "whitelist4"
+	setWl6      = "whitelist6"
+	setBan4     = "banned4"     // counter，无 interval：dynset v4 目标 + 全端口静默 drop
 	setBan4Nets = "banned4nets" // interval + counter：v4 段封禁（FireHOL 等 CIDR 名单），全端口静默 drop
-	setObPorts = "ob_ports"     // inet_service：出站自动白名单放行的新连接端口（空 = 全端口模式）
-	setObOk    = "ob_ok"        // ipv4：出站自动白名单（端口限定模式）
-	setObOk6   = "ob_ok6"       // ipv6：同上
-	setObAll   = "ob_all"       // ipv4：出站自动白名单（全端口模式，ports 为空时）
-	setObAll6  = "ob_all6"      // ipv6：同上
-	setBan6   = "banned6"  // interval + counter：IPv6 /64 段主集合（手动写入）
-	setPend6  = "pending6" // counter，无 interval：dynset v6 目标，周期搬运进 banned6
+	setObPorts  = "ob_ports"    // inet_service：出站自动白名单放行的新连接端口（空 = 全端口模式）
+	setObOk     = "ob_ok"       // ipv4：出站自动白名单（端口限定模式）
+	setObOk6    = "ob_ok6"      // ipv6：同上
+	setObAll    = "ob_all"      // ipv4：出站自动白名单（全端口模式，ports 为空时）
+	setObAll6   = "ob_all6"     // ipv6：同上
+	setBan6     = "banned6"     // interval + counter：IPv6 /64 段主集合（手动写入）
+	setPend6    = "pending6"    // counter，无 interval：dynset v6 目标，周期搬运进 banned6
 )
 
 // FW 是 nftables 防火墙封装。
 type FW struct {
-	conn  *nftables.Conn
-	table *nftables.Table
-	chain *nftables.Chain
-	ports *nftables.Set
-	wl4   *nftables.Set
-	wl6   *nftables.Set
-	ban4  *nftables.Set
+	conn     *nftables.Conn
+	table    *nftables.Table
+	chain    *nftables.Chain
+	ports    *nftables.Set
+	wl4      *nftables.Set
+	wl6      *nftables.Set
+	ban4     *nftables.Set
 	ban4Nets *nftables.Set
-	ban6  *nftables.Set
-	pend6 *nftables.Set
-	obPorts *nftables.Set
-	obOk  *nftables.Set
-	obOk6 *nftables.Set
-	obAll *nftables.Set
-	obAll6 *nftables.Set
+	ban6     *nftables.Set
+	pend6    *nftables.Set
+	obPorts  *nftables.Set
+	obOk     *nftables.Set
+	obOk6    *nftables.Set
+	obAll    *nftables.Set
+	obAll6   *nftables.Set
 }
 
 // New 建立 nftables 连接。
@@ -173,8 +173,9 @@ func (f *FW) Setup(ports []int) error {
 		return fmt.Errorf("写入端口失败: %w", err)
 	}
 
-	// 规则（established 回程放行最前，出站自动白名单其后）
+	// 规则（established 回程放行最前，回环接口豁免其次，出站自动白名单其后）
 	f.addRule(f.ruleEstablished())
+	f.addRule(f.ruleLoAccept())
 	f.addRule(f.ruleObAccept(false))
 	f.addRule(f.ruleObAccept(true))
 	f.addRule(f.ruleObAcceptAll(false))
@@ -225,11 +226,42 @@ func (f *FW) UnbanPrefix(p netip.Prefix) error {
 	return f.conn.Flush()
 }
 
+// internalNets 是"云内网可能真实存在"的源地址段（RFC1918 私网、CGNAT、
+// 链路本地、IPv6 ULA）。这些段作为入站源是合法流量：同 VPC 主机互访、
+// docker/容器网络（172.17/16 等）、内网负载均衡健康检查（100.64/10）、
+// 云元数据与内网 DNS（169.254/16）。因此不写入"全端口 drop"集合，
+// 否则内网与容器通信会被整体切断。
+//
+// 安全性：伪造此类源地址的包收不到任何回应（应答发往伪造地址），
+// 放行不产生信息泄露；外部伪造 127/8、0/8、192.0.2/24、224/3 等
+// 其余 bogon 段仍走链尾 drop。
+var internalNets = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+}
+
+// inInternalNet 判断前缀是否完全落在某个内网段内（仅完全落在才豁免）。
+func inInternalNet(p netip.Prefix) bool {
+	p = p.Masked()
+	for _, n := range internalNets {
+		if n.Bits() <= p.Bits() && n.Contains(p.Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
 // BanPrefixMany 批量封禁前缀段（外部黑名单组 diff 用，避免逐条 netlink 往返）：
 // v4 段进 banned4nets，v6 段进 banned6。
-// 关键处理：① 按段去重（名单间相同段）；② 排序后做区间合并——重叠/相邻区间合并为
+// 关键处理：① 按段去重（名单间相同段）；② 内网真实段（internalNets）跳过，
+// 不写入全端口 drop 集合；③ 排序后做区间合并——重叠/相邻区间合并为
 // 最大区间（interval 集合为半开区间 [start,end) 语义，任意区间用双端点编码写入，
-// 合并后覆盖完整、无重叠、段数最少，不会因 EEXIST 毁批）；③ 分批写入。
+// 合并后覆盖完整、无重叠、段数最少，不会因 EEXIST 毁批）；④ 分批写入。
 func (f *FW) BanPrefixMany(prefixes []netip.Prefix) error {
 	var v4pfx, v6pfx []netip.Prefix
 	seen := make(map[string]struct{}, len(prefixes))
@@ -239,6 +271,9 @@ func (f *FW) BanPrefixMany(prefixes []netip.Prefix) error {
 			continue
 		}
 		seen[p.String()] = struct{}{}
+		if inInternalNet(p) {
+			continue
+		}
 		if p.Addr().Is4() {
 			v4pfx = append(v4pfx, p)
 		} else {
@@ -831,6 +866,21 @@ func (f *FW) ruleEstablished() *nftables.Rule {
 		&expr.Ct{Register: 1, Key: expr.CtKeySTATE},
 		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: []byte{0x06, 0, 0, 0}, Xor: []byte{0, 0, 0, 0}},
 		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0, 0, 0, 0}},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	}}
+}
+
+// ruleLoAccept 规则 1：回环接口流量直接放行。
+// 回环包只可能由本机进程产生（外部伪造 127/8 源从 eth0 进来 iifname 不是 lo，
+// 仍会被链尾 bogon drop 拦下）。FireHOL 名单含 127.0.0.0/8 等 bogon 段，
+// 若不放行会导致本机 ping 127.0.0.1、本地 TCP、127.0.0.53 DNS 全部失效。
+// 编码与 nft 命令一致：iifname 是 16 字节 NUL 填充字符串（IFNAMSIZ）。
+func (f *FW) ruleLoAccept() *nftables.Rule {
+	name := make([]byte, 16)
+	copy(name, "lo")
+	return &nftables.Rule{Table: f.table, Chain: f.chain, Exprs: []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: name},
 		&expr.Verdict{Kind: expr.VerdictAccept},
 	}}
 }
