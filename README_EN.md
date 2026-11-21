@@ -63,7 +63,8 @@ cd /root/potlite && grep potlite-linux-amd64 /tmp/checksums.txt | sha256sum -c -
 | --- | --- |
 | `potlite install` | Install as a systemd service |
 | `potlite uninstall` | Uninstall (stop service, clear kernel bans, list all generated files) |
-| `potlite update` | Check for and auto-upgrade to the latest version |
+| `potlite update` | Check for and auto-upgrade to the latest version (GitHub source) |
+| `potlite update-ch` | Check for and auto-upgrade using the Gitee source (better for networks in China) |
 | `potlite reload` | Reload configuration (hot) |
 | `potlite restart` | Restart the service |
 | `potlite help` | Show usage |

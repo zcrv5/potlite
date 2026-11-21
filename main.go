@@ -97,7 +97,9 @@ func main() {
 	case "stats":
 		statsCmd(hasJSON())
 	case "update":
-		updateCmd()
+		updateCmd(githubSource)
+	case "update-ch":
+		updateCmd(giteeSource)
 	case "ban", "unban", "allow", "disallow":
 		if len(os.Args) < 3 {
 			usage()
@@ -133,7 +135,8 @@ func usage() {
   安装与管理
     potlite install              一键安装为系统服务
     potlite uninstall            卸载（停服、清内核封禁、列出全部产物文件）
-    potlite update               检查并自动升级到最新版本
+    potlite update               检查并自动升级到最新版本（GitHub 源）
+    potlite update-ch            使用 Gitee 源检查并自动升级（国内网络推荐）
     potlite reload               重载配置
     potlite restart              重启服务
 
@@ -153,21 +156,46 @@ func usage() {
 
 // ---------- update ----------
 
-// updateCmd 检查 GitHub 最新版本并自动下载替换升级。
-func updateCmd() {
+// releaseSource 描述升级来源：版本查询函数 + release 下载基址。
+type releaseSource struct {
+	label  string
+	latest func() (string, error)
+	base   func(ver string) string
+}
+
+// githubSource 默认升级源（GitHub Releases，供 update 使用）。
+var githubSource = &releaseSource{
+	label:  "GitHub",
+	latest: latestVersion,
+	base: func(v string) string {
+		return fmt.Sprintf("https://github.com/zcrv5/potlite/releases/download/v%s", v)
+	},
+}
+
+// giteeSource 国内升级源（Gitee Releases，供 update-ch 使用）。
+var giteeSource = &releaseSource{
+	label:  "Gitee",
+	latest: latestVersionGitee,
+	base: func(v string) string {
+		return fmt.Sprintf("https://gitee.com/zcrv5/potlite/releases/download/v%s", v)
+	},
+}
+
+// updateCmd 检查 src 指定源的最新版本并自动下载替换升级。
+func updateCmd(src *releaseSource) {
 	exe, err := os.Executable()
 	must(err)
-	latest, err := latestVersion()
+	latest, err := src.latest()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "potlite: 查询最新版本失败:", err)
+		fmt.Fprintf(os.Stderr, "potlite: 查询最新版本失败（%s 源）: %v\n", src.label, err)
 		os.Exit(1)
 	}
 	if latest == "" || latest == version {
 		fmt.Printf("已是最新版本（%s）\n", version)
 		return
 	}
-	fmt.Printf("发现新版本 v%s（当前 %s），正在下载…\n", latest, version)
-	base := fmt.Sprintf("https://github.com/zcrv5/potlite/releases/download/v%s", latest)
+	fmt.Printf("发现新版本 v%s（当前 %s，%s 源），正在下载…\n", latest, version, src.label)
+	base := src.base(latest)
 	// 1) 先取官方 checksums.txt 提取本架构哈希
 	wantHash := ""
 	csResp, err := http.Get(base + "/checksums.txt")
@@ -229,6 +257,30 @@ func latestVersion() (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	var rel struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.Unmarshal(body, &rel); err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(rel.TagName, "v"), nil
+}
+
+// latestVersionGitee 查询 Gitee 最新 release 版本号（不带 v 前缀）。
+func latestVersionGitee() (string, error) {
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Get("https://gitee.com/api/v5/repos/zcrv5/potlite/releases/latest")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", err

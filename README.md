@@ -64,7 +64,8 @@ cd /root/potlite && grep potlite-linux-amd64 /tmp/checksums.txt | sha256sum -c -
 | --- | --- |
 | `potlite install` | 一键安装为系统服务 |
 | `potlite uninstall` | 卸载（停服、清内核封禁、列出全部产物文件） |
-| `potlite update` | 检查并自动升级到最新版本 |
+| `potlite update` | 检查并自动升级到最新版本（GitHub 源） |
+| `potlite update-ch` | 使用 Gitee 源检查并自动升级（国内网络推荐） |
 | `potlite reload` | 重载配置 |
 | `potlite restart` | 重启服务 |
 | `potlite help` | 显示命令说明 |
